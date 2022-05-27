@@ -1528,7 +1528,7 @@ charged, and as often the club broke the charge and smashed him down.
 
 After a particularly fierce blow, he crawled to his feet, too dazed to
 rush. He staggered limply about, the blood flowing from nose and mouth
-and ears, his beautiful coat sprayed and flecked with bloody slaver.
+and ears, his beautiful coat sprayed and flecked with bloody <redacted>er.
 Then the man advanced and deliberately dealt him a frightful blow on
 the nose. All the pain he had endured was as nothing compared with the
 exquisite agony of this. With a roar that was almost lionlike in its
@@ -2333,7 +2333,7 @@ difficulties in seizing the kingdom of the Turk are that the usurper
 cannot be called in by the princes of the kingdom, nor can he hope to be
 assisted in his designs by the revolt of those whom the lord has around
 him. This arises from the reasons given above; for his ministers, being
-all slaves and bondmen, can only be corrupted with great difficulty, and
+all <redacted> and bondmen, can only be corrupted with great difficulty, and
 one can expect little advantage from them when they have been corrupted,
 as they cannot carry the people with them, for the reasons assigned.
 Hence, he who attacks the Turk must bear in mind that he will find him
