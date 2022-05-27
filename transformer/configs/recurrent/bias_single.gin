@@ -1,0 +1,15 @@
+
+decoder_stack.DecoderStack:
+  dstack_window_length = 0
+  recurrent_layer_indices = (-3,)
+  feedback_recurrence = False
+
+transformer_layer.TransformerLayer:
+  window_length = 512
+  recurrent_num_states = 512
+  recurrent_gate_type = "bias"
+  recurrent_single_gate = True
+  recurrent_skip_ffn = False
+
+training_loop.Trainer:
+  generate_every_steps = 0   # Not yet supported with recurrence.

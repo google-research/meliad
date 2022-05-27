@@ -1,0 +1,6 @@
+
+transformer_layer.TransformerLayer:
+  window_length = 512
+
+decoder_stack.DecoderStack:
+  dstack_window_length = 512

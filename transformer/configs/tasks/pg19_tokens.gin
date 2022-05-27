@@ -1,0 +1,9 @@
+
+NUM_EMBEDDINGS = 32128
+
+# Configure the input task.
+decoder_stack.TransformerTaskConfig:
+  dataset_name = "pg19_tokens"
+
+training_loop.Trainer:
+  num_steps = 500_000

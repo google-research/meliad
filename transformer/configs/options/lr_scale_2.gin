@@ -1,0 +1,3 @@
+
+training_loop.Trainer:
+  learning_rate_multiplier = 2.0

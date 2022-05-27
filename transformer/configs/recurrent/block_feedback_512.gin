@@ -1,0 +1,9 @@
+
+# Apply after the gate config.
+
+transformer_layer.TransformerLayer:
+  window_length = 512
+
+decoder_stack.DecoderStack:
+  dstack_window_length = 512
+  feedback_recurrence = True

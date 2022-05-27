@@ -1,0 +1,11 @@
+
+import  optimizer_config
+
+# Implement standard rsqrt decay as used in the memorizing and block-recurrent
+# transformer papers, which does not decay to a specified minimum learning
+# rate over max_steps.
+training_loop.Trainer:
+  learning_rate_schedule = @optimizer_config.lr_rsqrt_decay_std
+
+optimizer_config.lr_rsqrt_decay_std:
+    max_lr = None

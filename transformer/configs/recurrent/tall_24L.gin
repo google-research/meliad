@@ -1,0 +1,8 @@
+
+# Use a "tall" 24L configuration, with two recurrent layers.
+# Apply after the gate config.
+
+NUM_LAYERS = 24
+
+decoder_stack.DecoderStack:
+  recurrent_layer_indices = (9,19,)

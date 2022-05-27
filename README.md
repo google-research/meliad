@@ -30,7 +30,7 @@ Attention within a segment is done locally using _sliding window_ that is
 typically smaller than the segment length. A causal mask ensures that each
 token can attend to exactly _W_ previous tokens, where _W_ is the window size,
 e.g. 512 or 1024. The complexity of attention is quadratic with respect to
-window size, but linear with respect to segment length, so the segment length 
+window size, but linear with respect to segment length, so the segment length
 is limited only by available device memory.
 Like Transformer-XL, the model caches the keys and values from the last window
 for use on the next training step, and thus implements truncated backpropagation
@@ -84,11 +84,13 @@ source my_env/bin/activate
 ```
 
 Install required packages into the python virtual environment.  If you want to
-use GPUs, then Jax must be upgraded to use CUDA.
+use GPUs, then Jax must be upgraded to use CUDA.  Installing t5 after upgrading
+jax may be necessary to avoid link errors (we don't know why).
 
 ```
 pip install -r requirements.txt
 pip install --upgrade "jax[cuda]" -f https://storage.googleapis.com/jax-releases/jax_releases.html
+pip install t5
 ```
 
 On Unix systems, you may need to ensure that `PYTHONPATH` includes the

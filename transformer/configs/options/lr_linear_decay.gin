@@ -1,0 +1,10 @@
+
+import  optimizer_config
+
+training_loop.Trainer:
+  learning_rate_schedule = @optimizer_config.lr_linear_decay
+
+optimizer_config.lr_linear_decay:
+    max_lr = 0.01
+    min_lr = 0.001
+    decay_after = True

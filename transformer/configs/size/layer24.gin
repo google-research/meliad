@@ -1,0 +1,4 @@
+
+# Tall configuration, which doubles the number of layers and parameters.
+
+NUM_LAYERS = 24

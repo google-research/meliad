@@ -1,0 +1,5 @@
+
+# Apply after the gate config.
+
+transformer_layer.TransformerLayer:
+  recurrent_num_states = 512

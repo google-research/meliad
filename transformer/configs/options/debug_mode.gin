@@ -1,0 +1,5 @@
+
+training_loop.Trainer:
+  replicate_mode = False
+  trace_debug_mode = True
+  print_variables = True

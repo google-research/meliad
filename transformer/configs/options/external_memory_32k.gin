@@ -1,0 +1,17 @@
+
+include "memory_configuration.gin"
+
+from transformer import attention
+from transformer import memory_factory
+
+NUM_MEMORY_HEADS = %NUM_HEADS
+
+decoder_stack.DecoderStack:
+  memory_factory = @memory_factory.memory_on_tpu_factory
+  memory_layer_indices = (-4,)
+
+transformer_layer.TransformerLayer:
+  memory_num_neighbors = 128
+
+memory_factory.memory_on_tpu_factory:
+  database_size = 32768

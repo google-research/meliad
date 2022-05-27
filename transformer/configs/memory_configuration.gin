@@ -1,0 +1,34 @@
+# Configure external memory.
+# This file should be included after base_htrans.gin.
+
+import  training_loop
+from transformer import memory_factory
+
+MEMORY_HEAD_DIM = %HEAD_DIM
+NUM_MEMORY_HEADS = %gin.REQUIRED
+
+memory_factory.memory_on_tpu_factory:
+  num_heads = %NUM_MEMORY_HEADS
+  key_size = %MEMORY_HEAD_DIM
+  value_size = %MEMORY_HEAD_DIM
+  database_size = 8192
+  dtype = %DTYPE  # defined in base_htrans.gin
+
+memory_factory.memory_on_borg_factory:
+  num_heads = %NUM_MEMORY_HEADS
+  key_size = %MEMORY_HEAD_DIM
+  value_size = %MEMORY_HEAD_DIM
+  priority = "prod"
+  charged_user = "n2formal"
+  dump_updates_to_path = False
+
+memory_factory.memory_on_host_factory:
+  num_heads = %NUM_MEMORY_HEADS
+  key_size = %MEMORY_HEAD_DIM
+  value_size = %MEMORY_HEAD_DIM
+  database_size = 10_000
+
+training_loop.Trainer:
+  extra_summaries_fn = @abstract_memory.pull_memory_statistics_by_mode
+  log_every_steps = 100  # memory can slow down training, need responsive stats
+  checkpoint_every_steps = 1000

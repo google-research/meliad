@@ -1,0 +1,8 @@
+
+# Number of parameters = 151M
+NUM_LAYERS = 12
+EMBED_DIM = 1024
+NUM_HEADS = 8
+HEAD_DIM = 128
+MLP_DIM = 4096
+

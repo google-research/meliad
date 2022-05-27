@@ -1,0 +1,4 @@
+
+# Use 13 layers, for comparison against recurrent transformers.
+
+NUM_LAYERS = 13

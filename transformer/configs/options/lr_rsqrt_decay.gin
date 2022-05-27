@@ -1,0 +1,9 @@
+
+import  optimizer_config
+
+training_loop.Trainer:
+  learning_rate_schedule = @optimizer_config.lr_rsqrt_decay
+
+optimizer_config.lr_rsqrt_decay:
+    max_lr = 0.05
+    min_lr = 0.001

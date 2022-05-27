@@ -1,0 +1,4 @@
+
+# Sequence length must be larger than window_length.
+transformer_layer.TransformerLayer:
+  window_length = 2048
