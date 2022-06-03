@@ -21,13 +21,14 @@ from flax import linen
 import gin
 import jax
 
+from transformer import memory_layer
 
 
 PRNGKey = Any
 Shape = Tuple[int]
 Dtype = Any
 Array = Any
-MemoryResource = Any  # FIXME: abstract_memory.Memory
+MemoryResource = Any
 
 
 class MemoryManager:
@@ -79,10 +80,9 @@ class MemoryManager:
         if self.off_device_memory is None  #
         else self.num_heads)
     if self.off_device_memory is not None:
-      mem_layer = memory_layer.MemoryOffTpu(
-          memory=self.off_device_memory,
-          num_datasets=self.off_device_memory.num_heads,
-      )
+      mem_layer = None
+      if mem_layer is None:
+        raise ValueError("Off-device memory is not supported at this time.")
       return memory_layer.BatchedMemory(
           mem_layer,
           split_dimensions=(-2,),

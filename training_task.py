@@ -49,7 +49,7 @@ ExtraSummariesFunction = Optional[Callable[[str, int], Mapping[str, Any]]]
 
 def should_run(step: int, every_steps: int) -> bool:
   """Returns true if a periodic action should be run."""
-  return (every_steps > 0) and (step % every_steps == 0)
+  return (step > 0) and (every_steps > 0) and (step % every_steps == 0)
 
 
 class TrainingTask:

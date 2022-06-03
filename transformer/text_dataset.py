@@ -151,7 +151,7 @@ def load_text_dataset(name: str,
 
   if sequential:
     task_seqlen = None             # We do our own splitting.
-    shuffle_buffer_size = 256      # Number of full-length books.
+    shuffle_buffer_size = 1000     # Number of full-length books.
   else:
     task_seqlen = {"targets": sequence_length}  # Ask the task to do splitting.
     shuffle_buffer_size = 10_000   # Number of chunks.
@@ -167,7 +167,7 @@ def load_text_dataset(name: str,
       num_epochs=1)
 
   if sequence_length == 0:
-    return ds  # Don't chop into subsequences.
+    return (ds, vocab)  # Don't chop into subsequences.
 
   def extract_fn(article):
     return article["targets"]
