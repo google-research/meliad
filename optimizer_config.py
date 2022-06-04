@@ -15,7 +15,7 @@
 """Gin configurable optimizer definitions.
 """
 
-from typing import Optional
+from typing import Optional, Union
 
 from absl import logging
 from flax import optim
@@ -25,14 +25,17 @@ import jax.numpy as jnp
 import numpy as np
 
 
+OptimizerDef = Union[optim.OptimizerDef, t5x.optimizers.OptimizerDef]
+
+
 @struct.dataclass
 class OptimizerConfig:
   """Base class for optimizer configurations."""
 
   learning_rate: float = 0.01    # All optimizers have a learning rate.
 
-  def create_optimizer_def(self):
-    return None
+  def create_optimizer_def(self) -> OptimizerDef:
+    raise ValueError("Not implemented.")
 
 
 @gin.configurable

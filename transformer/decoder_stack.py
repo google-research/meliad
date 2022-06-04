@@ -345,7 +345,7 @@ class DecoderStack(nn.Module):
       ys = self.final_layernorm(ys)
 
     # Final dropout before token prediction.
-    drop_tile_shape = [1, 128, self.embedding_size]
+    drop_tile_shape = (1, 128, self.embedding_size)
     get_dropout_rng = lambda: self.make_rng("dropout")
     ys = nn_components.tiled_dropout(ys, drop_tile_shape,
                                      self.final_dropout_rate,
@@ -385,7 +385,7 @@ class DecoderStack(nn.Module):
     image = jnp.stack(rows)
     if scaled:
       image = jnp.exp(image)
-    image = metric_utils.normalize_image(image, "importance")
+    image = metric_utils.normalize_image(image, True)
     return metric_utils.reshape_image(image)
 
   def _make_images(self, viz_dicts, importance_list):

@@ -28,7 +28,7 @@ import jax.numpy as jnp
 
 PRNGKey = Any
 Array = jnp.ndarray
-Shape = Tuple[int]
+Shape = Tuple[int, ...]
 Dtype = Union[jnp.dtype, str]
 
 

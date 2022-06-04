@@ -35,7 +35,7 @@ from transformer import transformer_base
 
 Array = jnp.ndarray
 DecoderState = NewType("DecoderState", Mapping[str, Array])
-WindowState = Optional[attention.KVITuple]
+WindowState = Optional[Tuple[attention.KVITuple, Array]]
 KVITuple = attention.KVITuple
 
 
@@ -223,7 +223,9 @@ class TransformerLayer(nn.Module):
     if mode not in self.cached_kvi:
       # No cache, but we're using XL / sliding window, so return zeros.
       logging.info("tlayer: using zero as initial XL cache value.")
-      return attention.initial_kvi(self.window_length,
+      kvi_shape = (self.batch_size, self.window_length,
+                   self.num_heads, self.head_size)
+      return attention.initial_kvi(kvi_shape,
                                    self.compute_importance, dtype=self.dtype)
 
     # New documents start with zero_kv.
@@ -425,7 +427,7 @@ class TransformerLayer(nn.Module):
       # When training, attention is done using windows or chunks, and prior
       # context (e.g. keys,values from the previous window) is stored in the
       # window_state object.
-      (prev_kvi, recurrent_state) = window_state
+      (prev_kvi, recurrent_state) = window_state  # pytype: disable=attribute-error
 
       # Get the size of the sliding window for pos bias, dropout, & causal mask.
       (num_queries, num_keys) = attention.sliding_attention_window_shape(
@@ -455,7 +457,7 @@ class TransformerLayer(nn.Module):
       # The mask will be broadcast across batches and windows.
       if self.attn_dropout_rate > 0.0 and is_training:
         dropout_rng = self.make_rng("dropout")
-        attn_shape = [self.num_heads, num_queries, num_keys]
+        attn_shape = (self.num_heads, num_queries, num_keys)
         dropout_multiplier = nn_components.dropout_multiplier_mask(
             dropout_rng, self.attn_dropout_rate, attn_shape, self.dtype)
         logging.info("tlayer: attn_dropout = %r", dropout_multiplier)
@@ -662,7 +664,7 @@ class TransformerLayer(nn.Module):
     """Write window state to the cache."""
 
     (mode, update_cache, _) = self._get_cache_name_from_mode(self.mode)
-    (next_kvi, next_rec_state) = window_state
+    (next_kvi, next_rec_state) = window_state  # pytype: disable=attribute-error
     if update_cache and next_kvi is not None:
       logging.info("tlayer: Storing keys,values for mode %s in cache %s.",
                    self.mode, mode)

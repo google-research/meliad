@@ -136,7 +136,7 @@ class KVQLayer(nn.Module):
 
     # Project inputs to (keys, values, queries).
     (batch_size, num_keys, _) = xs.shape
-    drop_tile_shape = [1, 128, self.embedding_size]
+    drop_tile_shape = (1, 128, self.embedding_size)
 
     # Apply layernorm to input, rather than the output.
     # This provides better gradients through the resnet, and also avoids
@@ -381,7 +381,7 @@ class TransformerBase(nn.Module):
     assert attn_ys.shape == (batch_size, sequence_length,
                              self.num_heads, self.head_size)
     no_dropout = not self.is_training()
-    drop_tile_shape = [1, 128, self.embedding_size]
+    drop_tile_shape = (1, 128, self.embedding_size)
 
     # Concatenate cross-attention and self-attention results.
     if cross_attn_ys is not None:
