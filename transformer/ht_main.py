@@ -22,9 +22,8 @@ from absl import app
 from absl import flags
 from clu import platform
 import jax
-import tensorflow.compat.v2 as tf
-
 from transformer import launcher
+import tensorflow.compat.v2 as tf
 
 
 FLAGS = flags.FLAGS

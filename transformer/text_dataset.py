@@ -16,17 +16,17 @@
 
 import os
 import re
-from typing import Any, Callable, Dict, Iterable, Mapping, Optional, Set, Sequence, Tuple, Union
+from typing import Any, Callable, Dict, Iterable, Mapping, Optional, Sequence, Set, Tuple, Union
 
 from absl import flags
 from absl import logging
 import gin
 import jax
+from transformer import synthetic_text_data
 import numpy as np
 import seqio
 import tensorflow.compat.v2 as tf
 
-from transformer import synthetic_text_data
 
 
 flags.DEFINE_string("default_data_dir", None,

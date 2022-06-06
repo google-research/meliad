@@ -18,16 +18,12 @@ import time
 from typing import (Any, Callable, Dict, Iterator, Mapping, Optional, Tuple)
 
 from absl import logging
-
 from clu import metric_writers
-
 from flax import optim
 from flax import struct
-
 import jax
-import numpy as np
-
 import  metrics_summary
+import numpy as np
 
 
 @struct.dataclass

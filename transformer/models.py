@@ -17,20 +17,17 @@
 from typing import Any, Callable, Dict, Tuple
 
 from absl import logging
-
 from flax import linen as nn
 from flax.training import common_utils
 import gin
-
 import jax
 import jax.numpy as jnp
-import numpy as np
-import seqio
-
 import  metrics_summary
 from transformer import decoder_stack
 from transformer import metric_utils
 from transformer import text_dataset
+import numpy as np
+import seqio
 
 
 Array = jnp.ndarray

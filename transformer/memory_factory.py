@@ -20,8 +20,8 @@ from absl import logging
 from flax import linen
 import gin
 import jax
-
 from transformer import memory_layer
+
 
 
 PRNGKey = Any

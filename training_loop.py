@@ -16,30 +16,23 @@
 
 import functools
 import os
-
 from typing import (Any, Callable, Dict, Optional, Sequence, Tuple)
 
 from absl import logging
-
 from clu import metric_writers
-# from clu import periodic_actions
-
 import flax
 from flax import jax_utils
 from flax import linen as nn
 from flax import struct
 from flax.training import checkpoints
-
 import gin
 import jax
 import jax.numpy as jnp
-import numpy as np
-
-import tensorflow.compat.v2 as tf
-
 import  metrics_summary
 import  optimizer_config as opt_config
 import  training_task
+import numpy as np
+import tensorflow.compat.v2 as tf
 
 
 PRNGKeys = training_task.PRNGKeys

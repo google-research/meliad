@@ -23,9 +23,8 @@ from flax import linen as nn
 import gin
 from jax import lax
 import jax.numpy as jnp
-import numpy as np
-
 from transformer import position
+import numpy as np
 
 
 Array = Any

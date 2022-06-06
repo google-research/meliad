@@ -16,12 +16,11 @@
 
 import functools
 
+from transformer import text_dataset
 import seqio
 import t5.data
 from t5.data import preprocessors
 import tensorflow as tf
-
-from transformer import text_dataset
 
 
 TaskRegistry = seqio.TaskRegistry

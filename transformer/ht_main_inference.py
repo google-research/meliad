@@ -25,10 +25,9 @@ from absl import app
 from absl import flags
 from clu import platform
 import jax
-import tensorflow.compat.v2 as tf
-
 from transformer import inference_utils
-from transformer import tasks
+from transformer import tasks  # pylint: disable=unused-import
+import tensorflow.compat.v2 as tf
 
 
 flags.DEFINE_string("workdir", "", "Directory to save model checkpoints.")

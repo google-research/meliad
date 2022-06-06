@@ -53,9 +53,8 @@ from typing import Any, Optional
 from flax import linen as nn
 import gin
 import jax.numpy as jnp
-import numpy as np
-
 from transformer import position
+import numpy as np
 
 
 Array = jnp.ndarray

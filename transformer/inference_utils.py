@@ -21,16 +21,14 @@ and running the model over data.  It is intended for use in, e.g., colabs.
 from typing import Any, Dict, Optional, Sequence, Tuple
 
 from absl import logging
-
 import gin
 import jax
-import numpy as np
-import seqio
-
 import  training_loop
 from transformer import decoder_stack
 from transformer import models
 from transformer import text_dataset
+import numpy as np
+import seqio
 
 
 Trainer = training_loop.Trainer
