@@ -15,7 +15,7 @@
 """Gin configurable optimizer definitions.
 """
 
-from typing import Optional, Union
+from typing import Any, Optional
 
 from absl import logging
 from flax import optim
@@ -25,7 +25,7 @@ import jax.numpy as jnp
 import numpy as np
 
 
-OptimizerDef = Union[optim.OptimizerDef, t5x.optimizers.OptimizerDef]
+OptimizerDef = Any
 
 
 @struct.dataclass
