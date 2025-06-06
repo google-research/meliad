@@ -1,4 +1,4 @@
-# Copyright 2022 Google.
+# Copyright 2025 Google.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -19,30 +19,6 @@ import jax.numpy as jnp
 
 
 Array = Any
-
-
-def compute_accuracy_sum(logits, targets, valid_loss_mask=None):
-  """Compute accuracy for logits and targets.
-
-  Args:
-   logits: [batch, length, num_classes] float array.
-   targets: categorical targets [batch, length] int array.
-   valid_loss_mask: None or array of shape bool[batch, length]
-
-  Returns:
-    The number of correct tokens in the output.
-  """
-  if logits.shape[:-1] != targets.shape:
-    raise ValueError("Incorrect shapes. Got shape %s logits and %s targets" %
-                     logits.shape, targets.shape)
-  if valid_loss_mask is not None and valid_loss_mask.shape != targets.shape:
-    raise ValueError("Incorrect shapes. Got shape %s targets and %s mask" %
-                     targets.shape, valid_loss_mask.shape)
-
-  accuracy = jnp.equal(jnp.argmax(logits, axis=-1), targets)
-  if valid_loss_mask is not None:
-    accuracy = jnp.logical_and(accuracy, valid_loss_mask)
-  return jnp.sum(accuracy)  # Sum of the number of True values.
 
 
 def reshape_image(image):

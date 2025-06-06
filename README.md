@@ -58,8 +58,6 @@ while the cache is used for short-range lookups.
 However, memory should not be used with a sliding window, so the window and
 segment length should be the same.
 
-
-
 #### Block-Recurrent Transformer
 
 The [Block-Recurrent Transformer](https://arxiv.org/abs/2203.07852) equips one
@@ -72,6 +70,17 @@ the same as the window size.
 Recurrence serves a similar role to external memory, but is faster.  The
 recurrent state has a fixed capacity, but unlimited range (in theory).
 
+#### Melodi
+
+The [Melodi](https://arxiv.org/abs/2410.03156) model borrows ideas from both
+the Memorizing Transformer and the Block-Recurrent Transformer (BloRT), and
+adds KV-cache compression. Like BLoRT, it uses recurrence over blocks of
+tokens, but it does so in every layer, and the structure of the recurrence is
+different; recurrence in Melodi does not require extra parameters. The Melodi
+recurrence mechanism also performs KV-cache compression, and the compressed
+representations are then stored in a single long-term layer, somewhat like the
+memorizing transformer.
+
 
 ## Installation instructions
 
@@ -83,13 +92,13 @@ python -m venv my_env
 source my_env/bin/activate
 ```
 
-Install required packages into the python virtual environment.  If you want to
-use GPUs, then Jax must be upgraded to use CUDA.  Installing t5 after upgrading
+Install required packages into the python virtual environment. If you want to
+use GPUs, then Jax must be upgraded to use CUDA. Installing t5 after upgrading
 jax may be necessary to avoid link errors (we don't know why).
 
 ```
 pip install -r requirements.txt
-pip install --upgrade "jax[cuda]" -f https://storage.googleapis.com/jax-releases/jax_releases.html
+pip install --upgrade "jax[cuda12]"
 pip install t5
 ```
 
@@ -104,18 +113,25 @@ Run a small baseline model on a synthetic test dataset.
 
 ```shell
 python transformer/ht_main.py --alsologtostderr \
---gin_file=base_htrans.gin \
---gin_file=size/small_test.gin
+--gin_file=base_transformer.gin \
+--gin_file=size/tiny_test.gin
 ```
 
 ## Configuring and running the model
 
 Meliad uses [gin](https://github.com/google/gin-config) to configure the model.
-The first gin file should always be
-`base_htrans.gin`, which supplies a default configuration.  Other options are
-specified as additional files in the configs directory.  Most options are
-orthogonal, but in some cases the order matters; inspect the contents of the
-gin files to determine the correct order.
+The first gin file supplies a default configuration.  Options are:
+
+- `base_transformer.gin`  Vanilla transformer and Transformer XL.
+- `base_memory.gin`  The original memorizing and block-recurrent transformer.
+- `base_memory2.gin` Re-implementation of the memorizing transformer, with
+  dense rather than Top-K attention.
+- `base_melodi.gin`  The melodi model.
+
+
+Other options are specified as additional files in the configs directory.
+Most options are orthogonal, but in some cases the order matters; inspect the
+contents of the gin files to determine the correct order.
 
 Some important options are:
 
@@ -128,7 +144,7 @@ Some important options are:
 
 Tasks are also defined in gin files:
 
-- `tasks/pg19_tokens.gin` Run on PG19 with the default T5 sentencepiece
+- `tasks/pg19_tokens_t5.gin` Run on PG19 with the default T5 sentencepiece
   vocabulary.
 
 Other important command-line options:
@@ -138,18 +154,16 @@ Other important command-line options:
 - `--load_dir=/location/of/pretrained/model` For finetuning.
 - `--default_data_dir=/location/of/tfds/datasets` For tensorflow datasets.
 
-For the Memorizing Transformer:
-
-- `size/medium150M.gin`  The 150M parameter model in the paper.
-- `options/positions_t5.gin` Use a T5-style relative position bias.
-- `options/seq_512.gin` Segment length of 512.  (Window is 512 by default).
-- `options/external_memory_32k.gin` Memorizing Transformer with a memory
-  size of 32k.
-
 For the Block-Recurrent Transformer:
 
 - `size/medium150M.gin`  The 150M parameter model in the paper.
 - `options/positions_t5.gin` Use a T5-style relative position bias.
 - `options/seq_4096.gin` Segment length of 4096.  (Window is 512 by default).
 - `recurrent/bias_skip.gin` The fixed:skip configuration.
+
+For the Memorizing Transformer reimplementation:
+
+- `size/medium150M.gin`  The 150M parameter model in the paper.
+- `memory2/mem_densekv_64k.gin` Memorizing Transformer with a memory
+  size of 64k, and dense (rather than Top-K) attention.
 

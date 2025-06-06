@@ -1,0 +1,9 @@
+
+NUM_EMBEDDINGS = 32128
+
+# Configure the input task.
+language_model.TransformerTaskConfig:
+  dataset_name = "pg19_tokens_t5"
+
+training_loop.Trainer:
+  num_steps = 100_000

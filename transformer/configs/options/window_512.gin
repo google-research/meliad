@@ -1,4 +1,3 @@
 
 # Sequence length must be larger than window_length.
-transformer_layer.TransformerLayer:
-  window_length = 512
+WINDOW_LENGTH = 512

@@ -1,5 +1,4 @@
 
-training_loop.Trainer:
-  replicate_mode = False
+model_info.ModelInfo:
+  replicate_mode = "none"
   trace_debug_mode = True
-  print_variables = True

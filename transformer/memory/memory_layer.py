@@ -1,4 +1,4 @@
-# Copyright 2022 Google.
+# Copyright 2025 Google.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -18,7 +18,6 @@ import abc
 import functools
 from typing import Callable, Sequence, Tuple, TypeVar, Union
 
-from absl import logging
 from flax import linen
 import gin
 import jax
@@ -326,6 +325,7 @@ class MemoryOnTpu(MemoryLayer):
   key_features: int = 64
   value_features: int = 64
   report_scores_and_indices: bool = False
+  disallow_reset_because: str = ''
 
   def setup(self):
     self.db_index = self.variable('database', 'database_index',
@@ -390,8 +390,10 @@ class MemoryOnTpu(MemoryLayer):
     """Nearest neighbors by full multiplication and approximate top k on TPU."""
     query = lax.stop_gradient(query)
     unused_num_kv, num_datasets, query_features = query.shape
-    assert num_datasets == self.num_datasets
-    assert query_features == self.key_features
+    assert num_datasets == self.num_datasets, (
+        f'{num_datasets=} vs {self.num_datasets=}')
+    assert query_features == self.key_features, (
+        f'{query_features=} vs {self.key_features=}')
     query = jnp.moveaxis(query, source=1, destination=0)
 
     # Process different heads sequentially
@@ -412,6 +414,9 @@ class MemoryOnTpu(MemoryLayer):
 
   def reset(self, datasets: Array) -> int:
     """Resets specified datasets."""
+    if self.disallow_reset_because:
+      raise ValueError(
+          f'Error on reset. Explanation: {self.disallow_reset_because}')
     datasets = lax.stop_gradient(datasets)
     assert datasets.shape == (self.num_datasets,)
     assert datasets.dtype == jnp.bool_

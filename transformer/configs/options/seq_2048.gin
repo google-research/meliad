@@ -1,7 +1,6 @@
+SEGMENT_LENGTH = 2048
+USE_LONG_XL_ARCHITECTURE = True
 
-decoder_stack.TransformerTaskConfig:
-  sequence_length = 2048
+language_model.TransformerTaskConfig:
+  sequence_length = %SEGMENT_LENGTH
   batch_size = 2
-
-transformer_layer.TransformerLayer:
-  use_long_xl_architecture = True

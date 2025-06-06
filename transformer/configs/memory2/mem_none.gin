@@ -1,0 +1,6 @@
+
+# Lower baseline: no additional layer of any kind.
+simple_transformer_stack.TransformerStack:
+  side_layer_factory = None
+  side_layer_indices = ()
+  side_layer_is_mlp = False

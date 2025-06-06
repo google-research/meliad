@@ -1,26 +1,38 @@
+from __gin__ import dynamic_registration
 
 import  optimizer_config
+import  model_info
 import  training_loop
-from transformer import models
 from transformer import text_dataset
+
+
+
+# This must be set here because partitioning.PjitPartitioner is configured
+# using gin dynamic_registration, which will only work if it is called through
+# a gin-declared factory function.
+model_info.ModelInfo:
+  pjit_partitioner_factory = None
+  load_pretrained_config = [@model_info.LoadPretrainedConfig()]
+
 
 # Training setup.
 training_loop.Trainer:
-  model_definition = @models.DecoderOnlyLanguageModel
+  # model_definition = ...   # must be overridden
 
-  num_steps = 250_000
+  num_steps = 100_000
   status_every_steps = 10
   log_every_steps = 1000
   test_every_steps = 1000
   num_test_steps = 400
-  generate_every_steps = 5000
+  generate_every_steps = 0
   print_input_every_steps = 5000
+  parameter_metrics_every_steps = 2000
   checkpoint_every_steps = 5000
   save_checkpoints = True
-  restore_checkpoints = True
   use_separate_metric_directories = False
 
-  optimizer_factory = @optimizer_config.FlaxAdafactorConfig()
+  optimizer_factory = @optimizer_config.AdafactorConfig()
+  # optimizer_factory = @optimizer_config.AdamConfig()
   learning_rate_schedule = @optimizer_config.lr_cosine_decay
   max_scheduled_steps = 0   # Use num_steps as max_scheduled_steps.
   warmup_steps = 1000
@@ -28,8 +40,10 @@ training_loop.Trainer:
 
   rng_key_names = ("dropout", "sample")
 
+
 text_dataset.load_text_dataset:
   verbose = False  # if true, prints the start of every book/repo read from disk
+
 
 # Use cosine decay to max_scheduled_steps, as described in Chinchilla:
 # https://arxiv.org/abs/2203.15556
@@ -42,15 +56,17 @@ optimizer_config.lr_cosine_decay:
 
 
 # Adam optimizer configuration.
-# optimizer_config.AdamConfig:
-#   learning_rate = 0.05  # Will be multiplied by the LR schedule.
-#   beta1 = 0.9
-#   beta2 = 0.98
-#   weight_decay_rate = 0.0
+optimizer_config.AdamConfig:
+  learning_rate = 0.05  # Will be multiplied by the LR schedule.
+  beta1 = 0.9
+  beta2 = 0.98
+  weight_decay_rate = 0.0001
 
 # Adafactor optimizer configuration.
-optimizer_config.FlaxAdafactorConfig:
+optimizer_config.AdafactorConfig:
   learning_rate = 1.0   # Will be multiplied by the LR schedule.
-  beta1 = 0.9           # Can be "None".
+  decay_rate = 0.8
+  momentum = 0.9                 # Can be "None"
+  weight_decay_rate = None       # Can be "None"
 
 

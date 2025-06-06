@@ -1,0 +1,27 @@
+# Small test configuration for the original memorizing transformer and
+# block-recurrent transformer.
+NUM_LAYERS = 6
+EMBED_DIM = 128
+NUM_HEADS = 4
+HEAD_DIM = 64
+MLP_DIM = 512
+
+SEGMENT_LENGTH = 256   # 2 windows
+WINDOW_LENGTH = 128
+USE_LONG_XL_ARCHITECTURE = True
+
+language_model.TransformerTaskConfig:
+  dataset_name = "synthetic"
+  sequence_length = %SEGMENT_LENGTH
+  batch_size = 3
+
+training_loop.Trainer:
+  num_steps = 1000
+  warmup_steps = 100
+  log_every_steps = 5
+  test_every_steps = 10
+  num_test_steps = 1
+  generate_every_steps = 0
+  print_input_every_steps = 50
+  parameter_metrics_every_steps = 200
+  checkpoint_every_steps = 100

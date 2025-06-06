@@ -1,37 +1,31 @@
-# Small config for testing purposes
+# Tiny config for testing purposes.
+NUM_LAYERS = 3
+EMBED_DIM = 128
+NUM_HEADS = 4
+HEAD_DIM = 64
+MLP_DIM = 512
 
-NUM_LAYERS = 6
-EMBED_DIM = 512
-NUM_HEADS = 8
-HEAD_DIM = 128
-MLP_DIM = 2048
-DROPOUT_RATE = 0.1
-ATTN_DROPOUT_RATE = 0.1
+SEGMENT_LENGTH = 256  # 2 windows
+WINDOW_LENGTH = 128
+USE_LONG_XL_ARCHITECTURE = True
 
-decoder_stack.TransformerTaskConfig:
-  sequence_length = 512
-  batch_size = 2
+# For use by base_sidemem.gin and base_memory2.gin
+SIDE_LAYER_MLP_DIM = 512
+SIDE_LAYER_INDICES = (1,2)
+MEMORY_LAYER_INDICES = (1,)
 
-transformer_layer.TransformerLayer:
-  window_length = 256
-  use_long_xl_architecture = True
-  max_unrolled_windows = -1
-  recurrent_num_states = 384  # Odd number for debugging purposes.
-  recurrent_gate_type = "bias"
-  recurrent_single_gate = False
-  recurrent_skip_ffn = True
-
-decoder_stack.DecoderStack:
-  dstack_window_length = 0
-  recurrent_layer_indices = ()  # (-1,)
-  feedback_recurrence = False
+language_model.TransformerTaskConfig:
+  dataset_name = "synthetic"
+  sequence_length = %SEGMENT_LENGTH
+  batch_size = 3
 
 training_loop.Trainer:
-  num_steps = 10_000
-  status_every_steps = 5
-  log_every_steps = 20
-  test_every_steps = 50
-  num_test_steps = 2
-  generate_every_steps = 100
-  print_input_every_steps = 100
-  checkpoint_every_steps = 200
+  num_steps = 1000
+  warmup_steps = 100
+  log_every_steps = 5
+  test_every_steps = 10
+  num_test_steps = 1
+  generate_every_steps = 0
+  print_input_every_steps = 50
+  parameter_metrics_every_steps = 200
+  checkpoint_every_steps = 100

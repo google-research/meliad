@@ -1,4 +1,4 @@
-# Copyright 2022 Google.
+# Copyright 2025 Google.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,345 +14,380 @@
 
 """A single transformer layer."""
 
-from typing import Any, Mapping, NewType, Optional, Sequence, Tuple
+import functools
+from typing import Any, Callable, Dict, Literal, Mapping, NewType, Optional, Sequence, Tuple
 
 from absl import logging
-
-from flax import linen as nn
+from flax import linen
 import gin
 
 import jax
 import jax.numpy as jnp
 
 from transformer import attention
-from transformer import memory_factory
+from transformer import kv_cache
 from transformer import nn_components
 from transformer import position
+from transformer import position_alibi
 from transformer import position_fourier
+from transformer import position_nn
 from transformer import position_t5
-from transformer import transformer_base
 
 
-Array = jnp.ndarray
+Array = jax.Array
 DecoderState = NewType("DecoderState", Mapping[str, Array])
-WindowState = Optional[Tuple[attention.KVITuple, Array]]
 KVITuple = attention.KVITuple
+KVQITuple = attention.KVQITuple
+KVITupleFlaxVars = Tuple[Any, Any, Any]   # Tuple of flax Variables.
+ArraySeq = Sequence[Array]
+OptArray = Optional[Array]
+
+vshape = nn_components.vshape
 
 
 @gin.configurable
-class TransformerLayer(nn.Module):
+class TransformerLayer(linen.Module):
   """Full transformer layer, with attention."""
 
-  # Set by DecoderStack
+  # Set by parent (TransformerStack)
   mode: str
   batch_size: int
   embedding_size: int
-  cross_attention: bool = False
-  recurrent_attention: bool = False
-  memory: Optional[memory_factory.MemoryManager] = None
 
   # Configurable hyper-parameters
+  transformer_base_factory: Any = gin.REQUIRED
+
   num_heads: int = gin.REQUIRED
   head_size: int = gin.REQUIRED
+  mlp_dim: int = gin.REQUIRED
 
   window_length: int = gin.REQUIRED
   use_long_xl_architecture: bool = True
-  max_unrolled_windows: int = -1  # Always unroll.
-  relative_position_type: Optional[str] = "fourier"  # {None, "fourier", "t5"}
+  relative_position_type: Literal[
+      None, "fourier", "t5", "nn", "rotary", "orthogonal", "alibi"
+  ] = "t5"
   use_causal_mask: bool = True
   attn_dropout_rate: float = 0.0
 
-  recurrent_num_states: int = 0
-  recurrent_gate_type: str = "bias"
-  recurrent_single_gate: bool = False
-  recurrent_skip_ffn: bool = False
+  use_self_attention: bool = True              # Perform self-attention.
+  use_cross_attention: bool = False            # Perform cross-attention.
+  use_importance: bool = False                 # Takes importance as an input
+  parallel_windowed_attention: bool = True
 
-  compute_importance: bool = False
-  memory_num_neighbors: int = 0
-  memory_reset_on_new_doc: bool = True
+  # If true, use relative positions between decoder (xs) and encoder (cross_xs).
+  cross_attention_aligned_positions: bool = True
 
-  dtype: Any = jnp.float32
-
-  # Modes which support caching of previous keys and values.
-  supported_modes_for_cache: Sequence[str] = ("train", "test")
-  update_memory_modes: Sequence[str] = ("train", "test")
+  # Usually set by parent.
+  dtype: Any = gin.REQUIRED
 
   def supports_generate(self) -> bool:
     return self.use_long_xl_architecture
 
-  def _get_cache_name_from_mode(self, mode: str) -> Tuple[str, bool, bool]:
-    """Get the name of the cache, and whether to update the cache, from mode."""
-    # This is a hack to ensure that "generate" steps generate text as a
-    # continuation of the text that is stored in the "test" cache,
-    # but it does not update the "test" cache.
-    if mode == "generate":
-      assert "test" in self.supported_modes_for_cache
-      return ("test", False, False)   # Use test cache, but don't update it.
-    elif mode == "init":
-      return ("train", False, False)   # Use training cache for initialization.
-    else:
-      return (mode, True, mode in self.update_memory_modes)
-
-  def _allocate_cached_kvi(self, mode: str) -> KVITuple:
-    """Allocate (keys, values, importance) which can be cached between steps."""
-
-    kv_shape = [self.batch_size, self.window_length,
-                self.num_heads, self.head_size]
-    imp_shape = [self.batch_size, self.window_length]
-
-    def kv_initializer(shape):
-      return jnp.zeros(shape, dtype=self.dtype)
-
-    def imp_initializer(shape):
-      return jnp.zeros(shape, dtype=self.dtype)
-
-    pkeys = self.variable("state", "previous_keys_" + mode,
-                          kv_initializer, kv_shape)
-    pvals = self.variable("state", "previous_values_" + mode,
-                          kv_initializer, kv_shape)
-    if self.compute_importance:
-      pimportance = self.variable("state", "previous_importance_" + mode,
-                                  imp_initializer, imp_shape)
-    else:
-      pimportance = None
-    return (pkeys, pvals, pimportance)
-
-  def _allocate_cached_recurrent_state(self, mode: str):
-    rec_num_states = self.recurrent_num_states
-    st_shape = [self.batch_size, rec_num_states, self.embedding_size]
-
-    def st_initializer(shape):
-      return jnp.zeros(shape, dtype=self.dtype)
-
-    return self.variable("state", "recurrent_state_" + mode,
-                         st_initializer, st_shape)
-
   def setup(self):
     # Basic transformer functionality: everything except attention.
-
-    self.tbase = transformer_base.TransformerBase(
+    self.tbase = self.transformer_base_factory(
         mode=self.mode,
         embedding_size=self.embedding_size,
         num_heads=self.num_heads,
         head_size=self.head_size,
-        cross_attention_q=self.recurrent_attention or self.cross_attention,
-        cross_attention_kv=False,         # or True to use separate k,v.
+        mlp_dim=self.mlp_dim,
+        use_cross_attention=self.use_cross_attention,
+        cross_attention_dedicated_kv=True,
         num_position_embeddings=0,
-        num_cross_position_embeddings=0,  # or self.recurrent_num_states w/ k,v.
         dtype=self.dtype)
 
-    # Recurrent transformer functionality.
-    self.recurrent_tbase = None
-    if self.recurrent_attention:
-      # Recurrent transformer layer.
-      # We use a learned position embedding so that each element of the state
-      # can learn to query and compute different summaries.
-      self.recurrent_tbase = transformer_base.TransformerBase(
-          mode="pure",  # Disable dropout, which breaks jax.lax.scan.
-          embedding_size=self.embedding_size,
-          num_heads=self.num_heads,
-          head_size=self.head_size,
-          cross_attention_q=True,
-          cross_attention_kv=False,          # or True to use separate k,v.
-          num_position_embeddings=self.recurrent_num_states,
-          num_cross_position_embeddings=0,   # or self.window_length w/ k,v.
-          gate_type=self.recurrent_gate_type,
-          single_gate=self.recurrent_single_gate,
-          skip_ffn=self.recurrent_skip_ffn,
-          dtype=self.dtype)
-
-      # Initial state at start of document.
-      # We want this to be initially small, but large enough that adafactor
-      # will scale updates to a reasonable value.
-      self.recurrent_initial_state = self.param(
-          "recurrent_initial_state",
-          jax.nn.initializers.normal(stddev=0.1),
-          (self.recurrent_num_states, self.embedding_size), jnp.float32)
-
-      # Cached state from previous step for BPTT.
-      rec_state = {}
-      for mkey in self.supported_modes_for_cache:
-        rec_state[mkey] = self._allocate_cached_recurrent_state(mkey)
-      self.cached_recurrent_state = rec_state
-
     # Set up relative position encoding.
-    if self.relative_position_type == "fourier":
-      self.relative_positions = position_fourier.RelativeFourierPositions(
-          num_heads=self.num_heads,
-          max_number_of_keys=self.window_length,
-          dtype=self.dtype)
-    elif self.relative_position_type == "t5":
-      self.relative_positions = position_t5.T5RelativePositionBiases(
-          num_buckets=32,      # TODO(delesley): Let Gin configure these.
-          max_distance=128,
-          num_heads=self.num_heads,
-          dtype=self.dtype)
-    elif self.relative_position_type == "rotary":
-      # Rotary position encodings (RoPE).  No learned bias parameters.
-      self.relative_positions = None
-    else:
-      assert self.relative_position_type is None
-      self.relative_positions = None
+    self.relative_positions = get_relative_positions(
+        position_type=self.relative_position_type,
+        num_heads=self.num_heads,
+        window_length=self.window_length,
+        mode=self.mode,
+        dtype=self.dtype
+    )
 
     # Set up cache for Transformer-XL style architectures.
     # A separate cache is created for each each mode (e.g. train, test)
-    cached_kvi = {}
-    if self.use_long_xl_architecture:
-      for mkey in self.supported_modes_for_cache:
-        cached_kvi[mkey] = self._allocate_cached_kvi(mkey)
-    self.cached_kvi = cached_kvi
+    self.kvi_cache = kv_cache.KVICache(
+        mode=self.mode,
+        enable_cache=self.use_long_xl_architecture,
+        batch_size=self.batch_size,
+        window_length=self.window_length,
+        num_heads=self.num_heads,
+        head_size=self.head_size,
+        use_importance=self.use_importance,
+        dtype=self.dtype
+        )
 
-    # Set up external memory.
-    # A separate memory will be created for each mode (e.g. train, test)
-    mem_layers = {}
-    if self.memory is not None:
-      self.memory_bias = self.param("external_memory_bias", nn.zeros,
-                                    (self.num_heads,), "float32")
-      for mkey in self.supported_modes_for_cache:
-        mlayer = self.memory.create_memory_layer()
-        # Use setattr to setup the name and module containership hierarchy.
-        setattr(self, "mem_layer_" + mkey, mlayer)
-        mem_layers[mkey] = mlayer
-    self.mem_layers = mem_layers
-
-  def _get_cached_kvi(self, start_of_sequence: Array,
-                      mode: str) -> Optional[KVITuple]:
-    """Returns cached (keys, values, importance) from the previous step."""
-    if not self.use_long_xl_architecture:
-      return None
-    if mode not in self.cached_kvi:
-      # No cache, but we're using XL / sliding window, so return zeros.
-      logging.info("tlayer: using zero as initial XL cache value.")
-      kvi_shape = (self.batch_size, self.window_length,
-                   self.num_heads, self.head_size)
-      return attention.initial_kvi(kvi_shape,
-                                   self.compute_importance, dtype=self.dtype)
-
-    # New documents start with zero_kv.
-    # Continuing the same document will attend to previous keys/vals.
-    (pkeys, pvals, pimportance) = self.cached_kvi[mode]
-    (zkeys, zvals, zimportance) = attention.initial_kvi(
-        pkeys.value.shape, self.compute_importance, dtype=self.dtype)
-
-    # Broadcast start_of_sequence over non-batch dims.
-    b = self.batch_size
-    start_of_sequence_kv = jnp.reshape(start_of_sequence, [b, 1, 1, 1])
-    prev_keys = jnp.where(start_of_sequence_kv, zkeys, pkeys.value)
-    prev_vals = jnp.where(start_of_sequence_kv, zvals, pvals.value)
-    if self.compute_importance:
-      start_of_sequence_imp = jnp.reshape(start_of_sequence, [b, 1])
-      prev_importance = jnp.where(start_of_sequence_imp, zimportance,
-                                  pimportance.value)
+  def _get_rel_position_bias(self,
+                             num_queries: int,
+                             num_keys: int) -> Optional[Array]:
+    """Returns the relative position bias, if any."""
+    # The bias doesn't depend on the query content, and so can be precomputed.
+    bidirectional = not self.use_causal_mask
+    if self.relative_positions is not None:
+      rel_position_bias = self.relative_positions(num_queries, num_keys,
+                                                  bidirectional=bidirectional)
+      logging.info("tlayer: %s relative bias = %s",
+                   self.relative_position_type, vshape(rel_position_bias))
+      logging.info("tlayer: relative bias -- bidirectional = %s",
+                   bidirectional)
     else:
-      prev_importance = None
-    logging.debug("tlayer: start_of_sequence = %r", start_of_sequence)
-    logging.info("tlayer: prev_keys[%r] = %r", mode, prev_keys)
-    logging.debug("tlayer: prev_importance[%r] = %r", mode, prev_importance)
-    return (prev_keys, prev_vals, prev_importance)
+      logging.info("tlayer: no relative position bias.")
+      rel_position_bias = None
+    return rel_position_bias
 
-  def _set_cached_kvi(self, next_kvi: KVITuple, mode: str):
-    """Caches the last (keys, values, importance) from the current step."""
-    if not self.use_long_xl_architecture:
-      return
-    if mode not in self.cached_kvi:
-      return
+  def _get_causal_mask(self,
+                       num_queries: int,
+                       num_keys: int) -> Optional[Array]:
+    """Returns the causal mask, if any."""
+    # Get causal mask.
+    if self.use_causal_mask:
+      causal_mask = position.causal_mask(num_queries, num_keys,
+                                         window_length=self.window_length)
+      logging.info("tlayer: causal mask = %s", vshape(causal_mask))
+    else:
+      logging.info("tlayer: no causal mask.")
+      causal_mask = None
+    return causal_mask
 
-    (pkeys, pvals, pimportance) = self.cached_kvi[mode]
-    (nkeys, nvals, nimportance) = next_kvi   # From last window
-    logging.info("tlayer: next_keys[%r] = %r", mode, nkeys)
-    pkeys.value = nkeys
-    pvals.value = nvals
-    if self.compute_importance:
-      logging.info("tlayer: next_importance[%r] = %r", mode, nimportance)
-      pimportance.value = nimportance
+  def _get_attn_dropout_mask(self,
+                             num_queries: int,
+                             num_keys: int):
+    """Returns a mask that applies dropout to the attention matrix."""
+    # The mask is supplied as floating-point values, not boolean.
+    # The mask will be broadcast across batches and windows.
+    is_training = (self.mode == "train")
+    if self.attn_dropout_rate > 0.0 and is_training:
+      dropout_rng = self.make_rng("dropout")
+      attn_shape = (self.num_heads, num_queries, num_keys)
+      dropout_multiplier = nn_components.dropout_multiplier_mask(
+          dropout_rng, self.attn_dropout_rate, attn_shape, self.dtype)
+      logging.info("tlayer: attn_dropout = %s", vshape(dropout_multiplier))
+    else:
+      dropout_multiplier = None
+    return dropout_multiplier
 
-  def _get_cached_recurrent_state(self, start_of_sequence: Array,
-                                  mode: str) -> Optional[Array]:
-    """Returns cached recurrent state from the previous step."""
-    if not self.recurrent_attention:
-      return None
-    if mode not in self.cached_recurrent_state:
-      return None
+  def _get_number_of_windows(self, sequence_length: int, prev_kvi: Any) -> int:
+    """Returns the number of windows or blocks in the sequence."""
+    if sequence_length < self.window_length:
+      num_windows = 1  # Shouldn't happen, but it's not an error.
+    elif sequence_length == self.window_length:
+      num_windows = 1
+      if self.use_long_xl_architecture:
+        assert prev_kvi is not None
+    else:
+      if self.use_long_xl_architecture:
+        logging.info("tlayer: Using sliding window with Transformer XL.")
+        assert prev_kvi is not None
+      else:
+        logging.info("tlayer: Using sliding window without Transformer XL.")
+        assert prev_kvi is None
+      num_windows = sequence_length // self.window_length
+      if (num_windows * self.window_length) != sequence_length:
+        raise ValueError(f"Window length {self.window_length} must be a " +
+                         f"multiple of sequence length {sequence_length}")
+    logging.info("tlayer: num_windows = %d.", num_windows)
+    return num_windows
 
-    b = self.batch_size
-    rstate = self.cached_recurrent_state[mode].value
-    istate = jnp.asarray(self.recurrent_initial_state, dtype=self.dtype)
-    istate = istate[jnp.newaxis, :, :]   # Add batch dimension for broadcast.
-    logging.info("tlayer: get_cached_recurrent_state %r, %r", istate, rstate)
+  def single_window_attention(self,
+                              kvqi_w: KVQITuple,
+                              *,
+                              rel_position_bias: OptArray,
+                              causal_mask: OptArray,
+                              kq_relative_offset: int,
+                              dropout_multiplier: OptArray,
+                              attention_scale_factor: OptArray) -> Array:
+    """Does attention within a single window."""
+    (keys_w, values_w, queries_w, _, importance_w) = kvqi_w
 
-    start_of_sequence_st = jnp.reshape(start_of_sequence, (b, 1, 1))
-    return jnp.where(start_of_sequence_st, istate, rstate)
+    # If using RoPE, keys and queries are rotated before self-attention.
+    if self.relative_position_type == "rotary":
+      logging.info("tlayer: Rotary position encodings (RoPE), offset = %d",
+                   kq_relative_offset)
+      (keys_w, queries_w) = position.rotate_kq(keys_w, queries_w,
+                                               max_wavelength=10_000,
+                                               offset=kq_relative_offset)
+    # Self-attention over input tokens.
+    logging.info("tlayer: single window attention.")
+    attn_ys_w = attention.simple_attention(
+        keys_w, values_w, queries_w, importance_w,
+        relative_position_bias=rel_position_bias,
+        scale_factor=attention_scale_factor,
+        causal_mask=causal_mask,
+        dropout_multiplier=dropout_multiplier,
+        dtype=self.dtype)
+    return attn_ys_w
 
-  def _set_cached_recurrent_state(self, next_state: Array, mode: str):
-    """Store the next recurrent state in the cache."""
-    if not self.recurrent_attention:
-      return
-    if mode not in self.cached_recurrent_state:
-      return
+  def windowed_attention(self,
+                         single_window_attn_fn: Callable[[KVQITuple], Array],
+                         kvqi: KVQITuple,
+                         prev_kvi: Optional[KVITuple],
+                         *,
+                         start_of_sequence: Array,
+                         attention_scale_factors: Dict[str, OptArray],
+                         num_windows: int) -> Tuple[Array, Optional[KVITuple]]:
+    """Peform sliding window attention."""
+    # Unused in default implementation
+    del start_of_sequence
+    del attention_scale_factors  # folded into single_window_attn_fn
 
-    logging.info("tlayer: set_cached_recurrent_state %r", next_state)
-    rstate = self.cached_recurrent_state[mode]
-    rstate.value = next_state
+    logging.info("tlayer: windowed attention.")
+    if self.parallel_windowed_attention or num_windows == 1:
+      (attn_ys, next_kvi) = attention.parallel_sliding_window_attention(
+          single_window_attn_fn,
+          kvqi,
+          prev_kvi,
+          num_windows)
+    else:
+      (attn_ys, next_kvi) = attention.sequential_sliding_window_attention(
+          single_window_attn_fn,
+          kvqi,
+          prev_kvi,
+          num_windows)
+    return (attn_ys, next_kvi)
 
-  def _query_external_memory(self, keys: Array, values: Array, queries: Array,
-                             start_of_sequence: Array,
-                             mode: str, update_memory: bool):
-    """Query and update external memory."""
-    if self.memory is None:
-      return None
+  def self_attention(self,
+                     xs: Array,
+                     prev_kvi: Optional[KVITuple],
+                     *,
+                     start_of_sequence: Array,
+                     importance: OptArray) -> Tuple[Array, Optional[KVITuple]]:
+    """Perform sliding-window self-attention over the sequence xs.
 
-    # Make sure we initialize (allocate) the external memories for all modes.
-    # Per the flax lazy module initialization scheme, setup() will not be
-    # invoked on a submodule until that module is actually used.
-    if mode == "init":
-      for (_, mlayer) in self.mem_layers.items():
-        (_, _) = mlayer.topk_retrieval(queries, self.memory_num_neighbors)
-        mode = "train"  # Pretend we're in training mode during initialization.
+    Note that layer-norm, dropout etc. should have already been applied to xs.
 
-    if mode not in self.mem_layers:
-      return None
-    if self.memory_num_neighbors == 0:
-      raise ValueError("Using memory, but num_neighbors == 0")
+    Args:
+      xs: An array of shape (batch_size, seq_length, embed_dim),
+          which will be used to construct the queries, keys, and values.
+      prev_kvi: Cached keys and values for the last block of xs from the
+          previous step, when using Transformer-XL.
+      start_of_sequence: Boolean array of shape (batch_size,) which is true
+          if the current element is starting a new sequence.
+      importance: Optional array of shape (batch_size, seq_length,) which
+          contains the importance of token in the sequence.
 
-    # Grab the appropriate memory layer for the current mode.
-    memory_layer = self.mem_layers[mode]
+    Returns:
+      (attn_ys: of shape (batch_size, seq_length, num_heads, head_dim)
+       next_kvi: Keys and values from the last of window of xs, for caching.)
+    """
+    (_, sequence_length, _) = xs.shape
 
-    # Clear the relevant memories at the start of each new document.
-    if update_memory and self.memory_reset_on_new_doc:
-      # The number of "datasets" is batch_dim * num_heads.
-      # jnp.repeat will "broadcast" start_of_sequence over num_heads.
-      # E.g. if start_of_sequence = [True, False] and 4 heads,
-      # jnp.repeat will yield [T, T, T, T, F, F, F, F]
-      memory_layer.reset(jnp.repeat(start_of_sequence, self.num_heads))
+    # Compute keys, values, and queries.
+    logging.info("tlayer: self-attention -- compute keys,values,queries.")
+    (keys, values, queries) = self.tbase.kvq(xs)
 
-    # Query external memory, with queries.
-    (rkeys, rvals) = memory_layer.topk_retrieval(queries,
-                                                 self.memory_num_neighbors)
-    logging.info("tlayer: query external memory (%r): rvals = %r", mode, rvals)
+    # Compute masks and position info for the sliding window.
+    (num_queries, num_keys) = attention.sliding_attention_window_shape(
+        (keys, values, importance), prev_kvi, queries,
+        window_length=self.window_length)
+    num_windows = self._get_number_of_windows(sequence_length, prev_kvi)
+    rel_pos_bias = self._get_rel_position_bias(num_queries, num_keys)
+    causal_mask = self._get_causal_mask(num_queries, num_keys)
+    dropout_mul = self._get_attn_dropout_mask(num_queries, num_keys)
 
-    # Sanity check all dimensions are as expected.
-    assert rkeys.ndim == 5   # (b, seq_len, num_heads, num_neigh, head_dim)
-    assert rvals.ndim == 5
-    assert rkeys.shape == rvals.shape
-    assert rkeys.shape[0] == queries.shape[0]  # batch size
-    assert rkeys.shape[1] == queries.shape[1]  # sequence length
-    assert rkeys.shape[2] == self.num_heads
-    assert rkeys.shape[3] == self.memory_num_neighbors
-    assert rkeys.shape[4] == self.head_size
+    # Do sliding window self-attention.
+    single_window_attn_fn = functools.partial(
+        self.single_window_attention,
+        rel_position_bias=rel_pos_bias,
+        causal_mask=causal_mask,
+        kq_relative_offset=num_keys - num_queries,
+        dropout_multiplier=dropout_mul,
+        attention_scale_factor=self.tbase.self_attention_scale_factor())
 
-    # Update external memory, with (keys, values).
-    if update_memory:
-      memory_layer.update(keys, values)
-    return (rkeys, rvals)
+    kvqi = (keys, values, queries, None, importance)
+    (attn_ys, next_kvi) = self.windowed_attention(
+        single_window_attn_fn,
+        kvqi,
+        prev_kvi,
+        start_of_sequence=start_of_sequence,
+        attention_scale_factors=self.tbase.attention_scale_factors(),
+        num_windows=num_windows)
 
-  def __call__(self, xs: Array, start_of_sequence: Array,
+    return (attn_ys, next_kvi)
+
+  def aligned_cross_attention(self,
+                              xs: Array,
+                              cross_xs: Array,
+                              prev_cross_kvi: Optional[KVITuple],
+                             ) -> Tuple[Array, Optional[KVITuple]]:
+    """Perform positionally aligned cross-attention from xs to cross_xs.
+
+    Aligned cross-attention is a variant of cross-attention in which the
+    tokens from the encoder (cross_xs) and tokens from the decoder (xs) are
+    part of the same sequence, and thus have positions relative to each other.
+    The current implementation assumes an exact positional alignment between
+    xs and cross_xs, which happens when a later layer attends to an earlier
+    layer using skip connections.
+
+    Aligned cross-attention works just like sliding window self-attention,
+    except that the elements of xs attends to cross_xs, rather than to itself.
+    Because the two sequences are perfectly aligned, the implementation uses
+    relative positions and sliding windows in exactly the same way as
+    self-attention.
+
+    Note that layer-norm, dropout etc. should have already been applied to xs
+    and cross_xs.
+
+    Args:
+      xs: An array of shape (batch_size, seq_length, embed_dim),
+          which will be used to construct the queries.
+      cross_xs: An array of shape (batch_size, encoder_seq_length, embed_dim)
+          which will be used to construct the keys and values.
+      prev_cross_kvi: Cached keys and values for the last block of cross_xs
+          from the previous step, when using Transformer-XL.
+
+    Returns:
+      (cross_attn_ys: of shape (batch_size, seq_length, num_heads, head_dim)
+       next_kvi: Keys and values from the last window of cross_xs.)
+    """
+    (_, sequence_length, _) = xs.shape
+    # TODO(delesley): enable importance for cross-attention.
+    importance = None
+
+    # TODO(delesley): Add support for cases in which the two sequences are
+    # not perfectly aligned.
+
+    # TODO(delesley): Consider moving this method to a derived class, since
+    # aligned cross-attention is not exactly a standard operation.
+
+    # Compute keys, values, and queries for cross-attention.
+    logging.info("tlayer: cross-attention; compute keys,values,queries.")
+    (keys, values, queries) = self.tbase.cross_kvq(xs, cross_xs)
+
+    # Compute masks and position info for the sliding window.
+    (num_queries, num_keys) = attention.sliding_attention_window_shape(
+        (keys, values, importance), prev_cross_kvi, queries,
+        window_length=self.window_length)
+    num_windows = self._get_number_of_windows(sequence_length,
+                                              prev_cross_kvi)
+    rel_pos_bias = self._get_rel_position_bias(num_queries, num_keys)
+    causal_mask = self._get_causal_mask(num_queries, num_keys)
+    dropout_mul = self._get_attn_dropout_mask(num_queries, num_keys)
+
+    # Do sliding window cross-attention.
+    single_window_attn_fn = functools.partial(
+        self.single_window_attention,
+        rel_position_bias=rel_pos_bias,
+        causal_mask=causal_mask,
+        kq_relative_offset=num_keys - num_queries,
+        dropout_multiplier=dropout_mul,
+        attention_scale_factor=self.tbase.cross_attention_scale_factor())
+
+    kvqi = (keys, values, queries, None, importance)
+    (attn_ys, next_kvi) = attention.parallel_sliding_window_attention(
+        single_window_attn_fn,
+        kvqi,
+        prev_cross_kvi,
+        num_windows)
+
+    return (attn_ys, next_kvi)
+
+  def __call__(self,
+               xs: Array,
+               start_of_sequence: Array,
                *,
-               importance: Optional[Array] = None,
-               cross_attention_kv: Optional[Tuple[Array, Array]] = None,
-               window_state: Optional[WindowState] = None,
-               decoder_state: Optional[DecoderState] = None) -> (
-                   Tuple[Array, Optional[Array], Optional[WindowState],
-                         Optional[DecoderState], Any]):
+               cross_xs: Optional[Array] = None,
+               importance: Optional[Array] = None) -> Array:
     """Computes attention over a sequence of inputs.
 
     Args:
@@ -360,340 +395,112 @@ class TransformerLayer(nn.Module):
       start_of_sequence: An input array of shape (batch_size)
 
       --- The following must be passed by keyword only. ---
+      cross_xs: Additional inputs for cross-attention from the encoder (if any).
+          The embedding vectors in xs will cross-attend to those in cross_xs.
       importance: Array of shape (batch_size, sequence_length).
                   An importance bias for attention.
-      cross_attention_kv: Keys and values from encoder for cross-attention.
-      window_state: State object which contains context from the prior
-                    window when using a transformer-XL or sliding window.
-                    Initially created with load_window_state().
-      decoder_state: State object for autoregressive decoding, initially
-                     created with from init_decoder_state().
 
     Returns:
-      (ys: outputs of shape (batch_size, sequence_length, num_hidden),
-       importance: importance values for the next layer,
-       next_window_state: state to pass to the next window,
-       next_decoder_state: next decoder state for autoregressive decoding,
-       viz_dict: dictionary of visualizations
-      )
+      ys: outputs of shape (batch_size, sequence_length, num_hidden)
     """
 
     xs = jnp.asarray(xs, dtype=self.dtype)
-    logging.info("tlayer: xs = %r", xs)
-    logging.info("tlayer: recurrent = %r", self.recurrent_attention)
-    logging.info("tlayer: cross-attention = %r", cross_attention_kv is not None)
+    logging.info("tlayer: xs = %s", vshape(xs))
+    logging.info("tlayer: use_importance = %r", self.use_importance)
+    if importance is not None:
+      logging.info("tlayer: importance = %r", vshape(importance))
 
-    is_training = (self.mode == "train")
+    logging.info("tlayer: pre-attention (layernorm, dropout, etc.)")
+    xs_pre_attn = self.tbase.pre_attention(xs)
 
-    # Compute keys, values and queries.
-    # ---------------------------------
-    logging.info("tlayer: compute keys,values,queries.")
-    (keys, values, queries, queries2) = self.tbase.kvq(xs)
-    attention_scale_factors = self.tbase.attention_scale_factors()
-    (_, sequence_length, num_heads, _) = queries.shape  # (b, k, h, d)
+    # ==== Self attention. ====
+    attn_ys = None
+    if self.use_self_attention:
+      prev_kvi = self.kvi_cache.load_prev_cache(start_of_sequence)
 
-    # Get biases and masks that are shared across windows.
-    # ----------------------------------------------------
-    if decoder_state is not None:
-      logging.info("tlayer: using autoregressive decoder.")
-      # When decoding, prior keys,values are loaded from the decoder state.
-      # Other values are precomputed, and loaded from the decoder state.
-      # The decoder state will be updated with the current token.
-      assert window_state is None
+      (attn_ys, next_kvi) = self.self_attention(
+          xs_pre_attn,
+          prev_kvi,
+          start_of_sequence=start_of_sequence,
+          importance=importance,
+      )
 
-      prev_kvi = None
-      recurrent_state = None   # Use precomputed recurrent_kvq.
-      cross_attention_kv = None
-      rel_position_bias = decoder_state["relative_position_bias"]
-      causal_mask = None
-      dropout_multiplier = None
+      self.kvi_cache.store_next_cache(next_kvi)
 
-      # Reuse cached recurrent keys,values for each token.
-      cached_recurrent_kvq = decoder_state["recurrent_kvq"]
-      if cached_recurrent_kvq is not None:
-        assert cross_attention_kv is None
-        cross_attention_kv = (cached_recurrent_kvq[0], cached_recurrent_kvq[1])
-      del cached_recurrent_kvq
+    # ==== Cross attention. ====
+    cross_attn_ys = None
+    if self.use_cross_attention:
+      # TODO(delesley): Implement normal cross-attention as well.
+      assert self.cross_attention_aligned_positions
 
-      # Get a full window of keys,values and update decoder state.
-      (decoder_state, keys, values) = self._next_decoder_state(
-          decoder_state, keys, values)
+      cross_xs_pre_attn = self.tbase.pre_cross_attention(cross_xs)
+      del cross_xs
 
-      # Each query attends to window_length prior keys.
-      assert keys.shape[1] == self.window_length
-      kq_relative_offset = self.window_length
-    else:
-      logging.info("tlayer: windowed attention.")
-      # When training, attention is done using windows or chunks, and prior
-      # context (e.g. keys,values from the previous window) is stored in the
-      # window_state object.
-      (prev_kvi, recurrent_state) = window_state  # pytype: disable=attribute-error
+      # TODO(delesley): Enable multiple KV caches.
+      # There's only one KV-cache, so it can't be used for both self-attention
+      # and cross-attention at the same time.  The cache needs to be factored
+      # into a separate class.
+      assert not self.use_self_attention
+      prev_kvi = self.kvi_cache.load_prev_cache(start_of_sequence)
 
-      # Get the size of the sliding window for pos bias, dropout, & causal mask.
-      (num_queries, num_keys) = attention.sliding_attention_window_shape(
-          (keys, values, importance), prev_kvi, queries,
-          window_length=self.window_length)
-      kq_relative_offset = num_keys - num_queries
+      (cross_attn_ys, next_kvi) = self.aligned_cross_attention(
+          xs_pre_attn,
+          cross_xs_pre_attn,
+          prev_kvi)
 
-      # Get the relative position bias.
-      # The bias doesn't depend on the query content, and so can be precomputed.
-      if self.relative_positions is not None:
-        rel_position_bias = self.relative_positions(num_queries, num_keys,
-                                                    bidirectional=False)
-        logging.info("tlayer: %s relative bias = %r",
-                     self.relative_position_type, rel_position_bias)
-      else:
-        rel_position_bias = None
-
-      # Get causal mask.
-      if self.use_causal_mask:
-        causal_mask = position.causal_mask(num_queries, num_keys,
-                                           window_length=self.window_length)
-        logging.info("tlayer: causal mask = %r", causal_mask)
-      else:
-        causal_mask = None
-
-      # Apply dropout to the attention matrix.
-      # The mask will be broadcast across batches and windows.
-      if self.attn_dropout_rate > 0.0 and is_training:
-        dropout_rng = self.make_rng("dropout")
-        attn_shape = (self.num_heads, num_queries, num_keys)
-        dropout_multiplier = nn_components.dropout_multiplier_mask(
-            dropout_rng, self.attn_dropout_rate, attn_shape, self.dtype)
-        logging.info("tlayer: attn_dropout = %r", dropout_multiplier)
-      else:
-        dropout_multiplier = None
-
-    # Load and store values into external memory, if memory is not None.
-    # ------------------------------------------------------------------
-    (mode, _, update_memory) = self._get_cache_name_from_mode(self.mode)
-    external_kv = self._query_external_memory(
-        keys, values, queries,
-        start_of_sequence=start_of_sequence, mode=mode,
-        update_memory=decoder_state is None and update_memory)
-
-    if self.memory is not None:
-      external_memory_bias = jnp.asarray(self.memory_bias, dtype=self.dtype)
-      external_memory_bias = jnp.reshape(external_memory_bias,
-                                         (1, 1, num_heads, 1))
-      external_memory_bias = jax.nn.sigmoid(external_memory_bias)
-    else:
-      external_memory_bias = None
-
-    # Compute the number of windows.
-    # ------------------------------
-    if sequence_length < self.window_length:
-      num_windows = 1  # Happens with autoregressive decoding.
-    elif sequence_length == self.window_length:
-      num_windows = 1
-      if self.use_long_xl_architecture:
-        assert prev_kvi is not None
-    else:
-      if not self.use_long_xl_architecture:
-        raise ValueError("Can only use sliding window with Transformer XL.")
-      num_windows = sequence_length // self.window_length
-      if (num_windows * self.window_length) != sequence_length:
-        raise ValueError(f"Window length {self.window_length} must be a " +
-                         f"multiple of sequence length {sequence_length}")
-    logging.info("tlayer: num_windows = %d.", num_windows)
-
-    # Define the function to do attention within a single window.
-    # ---------------------------------------------------------
-    def single_window_attention(carry, inputs_w):
-      # This function uses the following variables from the outer scope.
-      # They are listed here for clarity.
-      nonlocal rel_position_bias
-      nonlocal causal_mask
-      nonlocal kq_relative_offset
-      nonlocal dropout_multiplier
-      nonlocal attention_scale_factors
-      nonlocal external_memory_bias
-      nonlocal cross_attention_kv  # externally supplied.
-
-      # keys,values,queries over the whole sequence will be split into chunks.
-      # xs_w, kvqi_w, etc. are the chunk for the current window.
-      (prev_kvi_w, rec_state) = carry  # carried from one window to the next.
-      (kvqi_w, external_kv_w) = inputs_w  # inputs to the current window.
-      # (keys_curr_w, values_curr_w, _, _, importance_curr_w) = kvqi_w
-
-      # Concatenate keys,values from the previous window with the current
-      # window to implement sliding window attention.
-      (kvqi_w, next_kvi_w) = attention.concat_kvqi(kvqi_w, prev_kvi_w)
-      (keys_w, values_w, queries_w, queries2_w, importance_w) = kvqi_w
-
-      # Perform recurrent attention within the current window to get the next
-      # recurrent state, and set up cross attention.
-      if rec_state is not None:
-        logging.info("tlayer: recurrent attention.")
-
-        # NOTE -- recurrent states and input tokens are handled separately,
-        # because they have separate learned positional embeddings.  Due to
-        # the way TransformerBase does cross-attention, this means that we use
-        # separate key,value layers for rec_state and tokens_w.
-
-        # Keys, values, queries from recurrent state.
-        logging.info("tlayer: recurrent kvq.")
-        rec_kvq = self.recurrent_tbase.kvq(rec_state)
-        r_scale_factors = self.recurrent_tbase.attention_scale_factors()
-        (r_keys, r_values, r_queries, r_queries2) = rec_kvq
-
-        # Joint attention over both recurrent states and input tokens.
-        logging.info("tlayer: recurrent self-attention.")
-        r_attn_ys = attention.simple_attention(
-            r_keys, r_values, r_queries, None,
-            scale_factor=r_scale_factors[0],
-            dtype=self.dtype)
-
-        logging.info("tlayer: recurrent cross-attention.")
-        r_cross_attn_ys = attention.simple_attention(
-            keys_w, values_w, r_queries2, importance_w,
-            scale_factor=r_scale_factors[1],
-            dtype=self.dtype)
-
-        # Recurrent post-attention FFN.
-        logging.info("tlayer: recurrent ffn.")
-        next_rec_state = self.recurrent_tbase.post_attn_ffn(
-            rec_state, r_attn_ys, r_cross_attn_ys)
-
-        # Get keys and values for cross-attention from recurrent state.
-        assert cross_attention_kv is None
-        local_cross_attention_kv = (r_keys, r_values)
-      else:
-        # Get keys and values for cross-attention from external argument.
-        next_rec_state = None
-        local_cross_attention_kv = cross_attention_kv
-
-      # If using RoPE, keys and queries are rotated before self-attention.
-      if self.relative_position_type == "rotary":
-        logging.info("Using rotary position encodings (RoPE), offset = %d",
-                     kq_relative_offset)
-        (keys_w, queries_w) = position.rotate_kq(keys_w, queries_w,
-                                                 max_wavelength=10_000,
-                                                 offset=kq_relative_offset)
-
-      # Self-attention over input tokens.
-      logging.info("tlayer: self-attention.")
-      attn_ys_w = attention.simple_attention(
-          keys_w, values_w, queries_w, importance_w,
-          relative_position_bias=rel_position_bias,
-          scale_factor=attention_scale_factors[0],
-          causal_mask=causal_mask,
-          dropout_multiplier=dropout_multiplier,
-          dtype=self.dtype)
-
-      # Attention over external memory.
-      if external_kv_w is not None:
-        (external_keys_w, external_values_w) = external_kv_w
-        y_ext = attention.external_attention(
-            external_keys_w, external_values_w, queries_w,
-            scale_factor=attention_scale_factors[0])
-        if external_memory_bias is not None:
-          ebias = external_memory_bias
-          logging.info("tlayer: using external memory bias = %r", ebias)
-          attn_ys_w = (attn_ys_w * (1 - ebias)) + (y_ext * ebias)
-        else:
-          attn_ys_w += y_ext
-
-      # Cross attention from input tokens to encoder or recurrent state.
-      if local_cross_attention_kv is not None:
-        logging.info("tlayer: cross-attention.")
-        (c_keys, c_values) = local_cross_attention_kv
-
-        # Cross-attention using queries2.
-        cross_attn_ys_w = attention.simple_attention(
-            c_keys, c_values, queries2_w, None,
-            scale_factor=attention_scale_factors[1],
-            dtype=self.dtype)
-      else:
-        cross_attn_ys_w = None
-
-      # End function single_window_attention(...)
-      return ((next_kvi_w, next_rec_state),
-              (attn_ys_w, cross_attn_ys_w))
-
-    # Initialize recurrent_tbase before calling jax.lax.scan.
-    # Otherwise flax will throw a tantrum.
-    if (self.recurrent_attention and 0 <= self.max_unrolled_windows and
-        self.max_unrolled_windows < num_windows):
-      logging.info("tlayer: force initialization of recurrent_tbase.")
-      self.recurrent_tbase.force_init(recurrent_state)
-
-    # Perform sliding window attention over all keys,values,queries.
-    # --------------------------------------------------------------
-    initial_carry = (prev_kvi, recurrent_state)  # window state.
-    kvqi = (keys, values, queries, queries2, importance)
-    attn_inputs = (kvqi, external_kv)
-    (next_carry, attn_outputs) = attention.split_and_scan(
-        single_window_attention,
-        initial_carry,
-        attn_inputs,
-        sections=num_windows,
-        axis=1,
-        max_unrolled_windows=self.max_unrolled_windows)
-    (attn_ys, cross_attn_ys) = attn_outputs
-
-    logging.info("tlayer: End windows.")
+      self.kvi_cache.store_next_cache(next_kvi)
 
     # Post-attention MLP, resnet, and FFN.
-    # ------------------------------------
     logging.info("tlayer: final FFN.")
     ys = self.tbase.post_attn_ffn(xs, attn_ys, cross_attn_ys)
+    return ys
 
-    importance_output = None
-    next_window_state = next_carry if window_state is not None else None
-    viz_dict = {}  # Visualizations, not currently enabled.
-    return (ys, importance_output, next_window_state, decoder_state, viz_dict)
+  def decode_token(self,
+                   xs: Array,
+                   decoder_state: DecoderState,
+                   *,
+                   importance: OptArray = None) -> Tuple[Array, DecoderState]:
+    """Implements inference for a single token."""
 
-  def load_window_state(self, start_of_sequence: Array) -> WindowState:
-    """Load cached state that is passed from one window to the next."""
+    # When decoding, prior keys,values are loaded from the decoder state.
+    # Other values are precomputed, and loaded from the decoder state.
+    # The decoder state will be updated with the current token.
+    xs = jnp.asarray(xs, dtype=self.dtype)
+    logging.info("tlayer: xs = %s", vshape(xs))
+    logging.info("tlayer: use_importance = %r", self.use_importance)
+    if importance is not None:
+      logging.info("tlayer: importance = %r", vshape(importance))
 
-    (mode, _, _) = self._get_cache_name_from_mode(self.mode)
-    prev_kvi = self._get_cached_kvi(start_of_sequence, mode)
-    rec_state = self._get_cached_recurrent_state(start_of_sequence, mode)
-    if prev_kvi is not None:
-      logging.info("tlayer: Loaded keys,values for mode %s from cache %s",
-                   self.mode, mode)
-    else:
-      logging.info("tlayer: Skipping XL cache for mode %s.", self.mode)
-    if rec_state is not None:
-      logging.info("tlayer: Loaded recurrent state for mode %s from cache %s.",
-                   self.mode, mode)
-    return (prev_kvi, rec_state)
+    # Compute keys, values and queries for current input token(s).
+    logging.info("tlayer: compute keys,values,queries.")
+    (keys, values, queries, _) = self.tbase.kvq(xs)
 
-  def store_window_state(self, window_state: WindowState):
-    """Write window state to the cache."""
+    # Load a full window of prior keys/values from the decoder_state,
+    # and update decoder_state by writing the current key,value to the state.
+    logging.info("tlayer: using autoregressive decoder.")
+    (decoder_state, keys, values) = self._next_decoder_state(
+        decoder_state, keys, values)
 
-    (mode, update_cache, _) = self._get_cache_name_from_mode(self.mode)
-    (next_kvi, next_rec_state) = window_state  # pytype: disable=attribute-error
-    if update_cache and next_kvi is not None:
-      logging.info("tlayer: Storing keys,values for mode %s in cache %s.",
-                   self.mode, mode)
-      self._set_cached_kvi(next_kvi, mode)
-    else:
-      logging.info("tlayer: Skipping XL cache update for mode %s.", self.mode)
-    if update_cache and next_rec_state is not None:
-      logging.info("tlayer: Storing recurrent state for mode %s in cache %s.",
-                   self.mode, mode)
-      self._set_cached_recurrent_state(next_rec_state, mode)
+    # Each query attends to window_length prior keys.
+    assert queries.shape[1] == 1
+    assert keys.shape[1] == self.window_length
 
-  def get_recurrent_kv(self, window_state: WindowState):
-    """Get the recurrent keys,values from window_state."""
+    kvqi = (keys, values, queries, None, importance)
+    attn_ys = self.single_window_attention(
+        kvqi,
+        rel_position_bias=decoder_state["relative_position_bias"],
+        causal_mask=None,
+        kq_relative_offset=self.window_length,
+        dropout_multiplier=None,
+        attention_scale_factor=self.tbase.self_attention_scale_factor())
 
-    # TODO(delesley): optimize.
-    # This isn't ideal, because we wind up computing the recurrent keys,values
-    # twice -- once within the sliding window above, and again in the
-    # DecoderStack, so they can be passed to other layers.  However, the
-    # plumbing is a lot simpler this way.
-    if window_state is None:
-      return None
-    (_, rec_state) = window_state
-    if rec_state is None:
-      return None
-    logging.info("tlayer: get_recurrent_kv.")
-    (r_keys, r_values, _, _) = self.recurrent_tbase.kvq(rec_state)
-    return (r_keys, r_values)
+    # Post-attention MLP, residual connection, and FFN.
+    logging.info("tlayer: final FFN.")
+    ys = self.tbase.post_attn_ffn(xs, attn_ys, None)
+    return (ys, decoder_state)
 
-  def init_decoder_state(self, sequence_length: int,
+  def init_decoder_state(self,
+                         sequence_length: int,
                          start_of_sequence: Array) -> DecoderState:
     """Initialize decoder state for autoregressive generation.
 
@@ -713,7 +520,7 @@ class TransformerLayer(nn.Module):
     if not self.use_causal_mask:
       raise ValueError("Generator must have been trained with a causal mask.")
 
-    (mode, _, _) = self._get_cache_name_from_mode(self.mode)
+    assert self.use_causal_mask
 
     # Get relative position bias.
     if self.relative_positions is not None:
@@ -734,7 +541,8 @@ class TransformerLayer(nn.Module):
     start_index = self.window_length
 
     # Copy keys,values from cache into storage, for use as a prefix.
-    prev_kvi = self._get_cached_kvi(start_of_sequence, mode)
+    prev_kvi = self.kvi_cache.load_prev_cache(start_of_sequence)
+
     if prev_kvi is not None:
       (pkeys, pvals, prev_imps) = prev_kvi
       assert prev_imps is None  # Not yet supported.
@@ -746,25 +554,18 @@ class TransformerLayer(nn.Module):
       stored_values = jax.lax.dynamic_update_slice_in_dim(
           stored_values, pvals, 0, axis=1)
 
-    # Grab the current recurrent_state, and precompute keys,values,queries.
-    rstate = self._get_cached_recurrent_state(start_of_sequence, mode)
-    if rstate is not None:
-      recurrent_kvq = self.recurrent_tbase.kvq(rstate)
-    else:
-      recurrent_kvq = None
-
     decoder_state_dict = {
         "keys": stored_keys,
         "values": stored_values,
         "current_index": start_index,
         "relative_position_bias": rel_position_bias,
-        "recurrent_kvq": recurrent_kvq
     }
     return DecoderState(decoder_state_dict)
 
-  def _next_decoder_state(self, decoder_state: DecoderState,
-                          keys: Array, values: Array) -> Tuple[
-                              DecoderState, Array, Array]:
+  def _next_decoder_state(self,
+                          decoder_state: DecoderState,
+                          keys: Array,
+                          values: Array) -> Tuple[DecoderState, Array, Array]:
     """Compute the next decoder state, and return keys,values to attend to.
 
     The keys,values returned from this function are drawn from the prior
@@ -784,7 +585,7 @@ class TransformerLayer(nn.Module):
 
     assert keys.shape[1] == 1   # single-token autoregressive decoding.
 
-    logging.info("attn_layer: next decoder state; key = %r", keys)
+    logging.info("attn_layer: next decoder state; key = %s", vshape(keys))
 
     # Unpack decoder_state
     stored_keys = decoder_state["keys"]
@@ -812,6 +613,62 @@ class TransformerLayer(nn.Module):
     out_decoder_state["current_index"] = curr_index
     out_decoder_state["relative_position_bias"] = (
         decoder_state["relative_position_bias"])
-    out_decoder_state["recurrent_kvq"] = decoder_state["recurrent_kvq"]
 
     return (DecoderState(out_decoder_state), out_keys, out_values)
+
+
+def get_relative_positions(
+    position_type: Literal[
+        None, "fourier", "t5", "nn", "rotary", "orthogonal", "alibi"
+    ],
+    num_heads: int,
+    window_length: int,
+    mode: str,
+    dtype: Any = jnp.float32):
+  """Return a relative position bias layer for the given named type.
+
+  Args:
+    position_type: The type of relative position encoding to use.
+    num_heads: The number of attention heads.
+    window_length: The window length of the model.
+    mode: The mode of the model.
+    dtype: The data type of the model.
+  Returns:
+    relative_positions: The relative position bias layer.
+  """
+
+  if position_type == "fourier":
+    relative_positions = position_fourier.RelativeFourierPositions(
+        num_heads=num_heads,
+        max_number_of_keys=window_length,
+        dtype=dtype)
+  elif position_type == "t5":
+    relative_positions = position_t5.T5RelativePositionBiases(
+        num_buckets=32,   # TODO(delesley): Let Gin configure these.
+        max_distance=128,
+        num_heads=num_heads,
+        dtype=dtype)
+  elif position_type == "nn":
+    relative_positions = position_nn.NNRelativePositionBiases(
+        num_heads=num_heads,
+        dtype=dtype,
+    )
+  elif position_type == "orthogonal":
+    relative_positions = position_nn.OrthogonalBasisPositionBias(
+        mode=mode,
+        num_heads=num_heads,
+        dtype=dtype,
+    )
+  elif position_type == "alibi":
+    relative_positions = position_alibi.BoundedALiBiIntegerPositions(
+        num_heads=num_heads,
+    )
+  elif position_type == "rotary":
+    # Rotary position encodings (RoPE).  No learned bias parameters.
+    relative_positions = None
+  else:
+    assert position_type is None
+    relative_positions = None
+
+  return relative_positions
+

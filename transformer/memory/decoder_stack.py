@@ -1,4 +1,4 @@
-# Copyright 2022 Google.
+# Copyright 2025 Google.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,38 +15,23 @@
 """Hierarchical transformer."""
 
 import functools
-from typing import Any, Callable, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Optional, Sequence, Tuple
 
 from absl import logging
 
-from flax import linen as nn
-from flax import struct
+from flax import linen
 import gin
+import jax
 import jax.numpy as jnp
 from transformer import attention
-from transformer import metric_utils
+from transformer import language_model
 from transformer import nn_components
 from transformer import position
-from transformer import transformer_layer
+from transformer.memory import transformer_layer
 
 
-Array = Any
-
-
-# Basic task options are shared among multiple classes.
-@gin.configurable
-@struct.dataclass
-class TransformerTaskConfig:
-  """Configuration hyperparameters for sequence-to-sequence tasks."""
-
-  dataset_name: str = "synthetic"
-  train_split: str = "train"
-  test_split: str = "test"
-  sequential_chunks: bool = True  # Process chunks of text in sequential order.
-
-  sequence_length: int = 4096
-  batch_size: int = 1  # per device batch size
-  vocab_size: int = 256
+Array = jax.Array
+vshape = nn_components.vshape
 
 
 DStackDecoderState = Tuple[transformer_layer.DecoderState, ...]
@@ -54,11 +39,12 @@ DStackWindowState = Tuple[transformer_layer.WindowState, ...]
 
 
 @gin.configurable
-class DecoderStack(nn.Module):
+class DecoderStack(linen.Module):
   """Stack of transformer decoder layers."""
 
+  # Supplied by DecoderOnlyLanguageModel
   mode: str
-  task_config: TransformerTaskConfig = gin.REQUIRED
+  task_config: language_model.TransformerTaskConfig
 
   # Configurable hyperparameters.
   num_layers: int = gin.REQUIRED
@@ -74,7 +60,7 @@ class DecoderStack(nn.Module):
   use_absolute_positions: bool = False
   use_final_layernorm: bool = True
   final_dropout_rate: float = 0.0
-  final_mlp_factory: Optional[Callable[[int], nn.Module]] = None
+  final_mlp_factory: Optional[Callable[[int], linen.Module]] = None
 
   # Enable recurrence on particular layers.
   recurrent_layer_indices: Sequence[int] = ()
@@ -84,6 +70,8 @@ class DecoderStack(nn.Module):
   memory_factory: Any = None
   # Layers to equip with external memory.
   memory_layer_indices: Sequence[int] = ()
+  # Disable position encoding on layers with external memory?
+  disable_position_encoding_for_memory_layers: bool = False
 
   dtype: Any = jnp.float32
 
@@ -93,14 +81,18 @@ class DecoderStack(nn.Module):
   def supports_generate(self) -> bool:
     return all([lyr.supports_generate() for lyr in self.transformer_layers])
 
+  def accepts_global_info(self) -> bool:
+    # Declare that __call__ takes a global_info named parameter
+    return True
+
   def setup(self):
     task_config = self.task_config
 
-    embed_init = nn.initializers.normal(stddev=self.embedding_stddev,
-                                        dtype=jnp.float32)
-    self.embed = nn.Embed(num_embeddings=task_config.vocab_size,
-                          features=self.embedding_size,
-                          embedding_init=embed_init)
+    embed_init = linen.initializers.normal(stddev=self.embedding_stddev,
+                                           dtype=jnp.float32)
+    self.embed = linen.Embed(num_embeddings=task_config.vocab_size,
+                             features=self.embedding_size,
+                             embedding_init=embed_init)
 
     # Create a memory_factory.MemoryManager object, which is shared among
     # all transformer layers.  Each layer will use the MemoryManager object
@@ -108,7 +100,7 @@ class DecoderStack(nn.Module):
     memory = None
     if self.memory_factory is not None:
       if self.memory_layer_indices:
-        memory = self.memory_factory(batch_size=task_config.batch_size,
+        memory = self.memory_factory(batch_size=task_config.batch_size,   # pylint: disable=not-callable
                                      mode=self.mode)
       else:
         logging.warning(
@@ -156,7 +148,10 @@ class DecoderStack(nn.Module):
             # We use partial function applications here only to avoid
             # overwriting the head size unless memory is involved.
             head_size=mem.key_size,
-            num_heads=mem.num_heads)
+            num_heads=mem.num_heads,
+        )
+        if self.disable_position_encoding_for_memory_layers:
+          layer_fn = functools.partial(layer_fn, relative_position_type=None)
       layers.append(layer_fn())
     self.transformer_layers = layers
 
@@ -164,7 +159,7 @@ class DecoderStack(nn.Module):
       self.final_layernorm = nn_components.LayerNorm()
 
     if self.final_mlp_factory is not None:
-      self.final_mlp = self.final_mlp_factory(self.embedding_size)
+      self.final_mlp = self.final_mlp_factory(self.embedding_size)  # pylint: disable=not-callable
 
   def init_decoder_state(self, sequence_length: int,
                          start_of_sequence: Array) -> DStackDecoderState:
@@ -182,13 +177,15 @@ class DecoderStack(nn.Module):
     ])
 
   def store_window_state(self, window_state: DStackWindowState):
-    """Write window state to the cache."""
+    """Write window state for each layer to the cache."""
     for (layer, wstate) in zip(self.transformer_layers, window_state):
       layer.store_window_state(wstate)
 
   def _eval_layer_stack(self, xs: Array, start_of_sequence: Array,
                         window_state: Optional[DStackWindowState],
-                        decoder_state: Optional[DStackDecoderState]) -> (
+                        decoder_state: Optional[DStackDecoderState],
+                        *,
+                        global_info: Dict[str, Any]) -> (
                             Tuple[Array, Optional[DStackWindowState],
                                   Optional[DStackDecoderState], Any]):
     """Evaluate a stack of transformer layers on an input."""
@@ -225,11 +222,14 @@ class DecoderStack(nn.Module):
       wstate_i = None if window_state is None else window_state[i]
       dstate_i = None if decoder_state is None else decoder_state[i]
       (ys, importance, n_wstate_i, n_dstate_i, viz_dict) = layer(
-          ys, start_of_sequence,
+          ys,
+          start_of_sequence,
           importance=importance,
-          cross_attention_kv=cross_kv,   # cross-attend to recurrent_kv.
+          cross_attention_kv=cross_kv,  # cross-attend to recurrent_kv.
           window_state=wstate_i,
-          decoder_state=dstate_i)
+          decoder_state=dstate_i,
+          global_info=global_info,
+      )
       next_window_states.append(n_wstate_i)
       next_decoder_states.append(n_dstate_i)
       attn_viz_dicts.append(viz_dict)
@@ -239,11 +239,10 @@ class DecoderStack(nn.Module):
     return (ys, window_state, decoder_state, attn_viz_dicts)
 
   def __call__(self,
-               input_tokens: Array,
-               target_tokens: Array,
-               start_of_sequence: Array,
-               decoder_state: Optional[DStackDecoderState] = None) -> (
-                   Tuple[Array, Optional[DStackDecoderState], Any]):
+               inputs: Dict[str, Array],
+               *,
+               global_info: Dict[str, Any],
+               decoder_state: Optional[DStackDecoderState] = None) -> Any:
     """Call the decoder stack.
 
     This function will embed tokens, run the embeddings through a stack of
@@ -252,10 +251,13 @@ class DecoderStack(nn.Module):
     logits.
 
     Args:
-      input_tokens: Integer array of shape [batch_size, sequence_length]
-      target_tokens: For compatibility.  Ignored by this class.
-      start_of_sequence: Boolean array of shape [batch_size],
-          which indicates whether a sequence is at the start of sequence.
+      inputs: Dictionary of shape {
+          "input_tokens": Integer array of shape [batch_size, sequence_length]
+          "start_of_sequence": Boolean array of shape [batch_size],
+              which indicates whether a sequence is at the start of sequence.
+      }
+      global_info:  A dictionary of global information (e.g., current training
+        step as "step").
       decoder_state: State object for autoregressive decoding,
           created from init_decoder_state.
 
@@ -265,6 +267,11 @@ class DecoderStack(nn.Module):
         viz_dict: dictionary of visualizations,
        )
     """
+
+    input_tokens = inputs["input_tokens"]
+    target_tokens = inputs["target_tokens"]
+    start_of_sequence = inputs["start_of_sequence"]
+
     del target_tokens
     task_config = self.task_config
 
@@ -272,7 +279,7 @@ class DecoderStack(nn.Module):
     embeddings = self.embed(input_tokens)  # (batch_size, seq_len, num_hidden)
     embeddings = embeddings.astype(self.dtype)
     sequence_length = embeddings.shape[1]
-    logging.info("dstack: embeddings = %r", embeddings)
+    logging.info("dstack: embeddings = %s", vshape(embeddings))
 
     # Add absolute position encodings if necessary.
     if self.use_absolute_positions:
@@ -284,7 +291,7 @@ class DecoderStack(nn.Module):
           max_wavelength=10_000)
       positions = jnp.asarray(positions, dtype=self.dtype)
       positions = jnp.expand_dims(positions, 0)  # Add batch dimension.
-      logging.info("dstack: absolute positions = %r", positions)
+      logging.info("dstack: absolute positions = %s", vshape(positions))
       embeddings = embeddings + positions
 
     # Function to run the whole transformer stack on a single window.
@@ -292,8 +299,12 @@ class DecoderStack(nn.Module):
     def single_window_stack(carry, inputs_w):
       (window_state_w, start_of_seq_w) = carry
       (outputs_w, window_state_w, _, _) = self._eval_layer_stack(
-          inputs_w, start_of_seq_w,
-          window_state=window_state_w, decoder_state=None)
+          inputs_w,
+          start_of_seq_w,
+          window_state=window_state_w,
+          decoder_state=None,
+          global_info=global_info,
+      )
 
       # start_of_sequence is false after the first window.
       bsize = self.task_config.batch_size
@@ -319,24 +330,24 @@ class DecoderStack(nn.Module):
 
       # Scan single_window_stack over the sequence.
       cstate = (window_state, start_of_sequence)
-      (cstate, ys) = attention.split_and_scan(single_window_stack,
-                                              cstate,
-                                              embeddings,
-                                              sections=num_windows,
-                                              axis=1)
+      (cstate, ys) = attention.split_and_scan(
+          single_window_stack, cstate, embeddings, sections=num_windows, axis=1
+      )  # pytype: disable=wrong-arg-types
       (window_state, _) = cstate
 
       # Cache state for the next training step, for truncated BPTT.
       self.store_window_state(window_state)
-      attn_viz_dicts = {}  # Temporarily disabled.
     else:
       logging.info("dstack: autoregressive generator.")
       # Run as an autoregressive decoder: evaluate the whole stack on a token.
       # Do not load or store window_state; decoder_state is used instead.
       (ys, _, decoder_state, _) = self._eval_layer_stack(
-          embeddings, start_of_sequence,
-          window_state=None, decoder_state=decoder_state)
-      attn_viz_dicts = {}
+          embeddings,
+          start_of_sequence,
+          window_state=None,
+          decoder_state=decoder_state,
+          global_info=global_info,
+      )
 
     # Apply layernorm to the final output, before calculating logits.
     # With a pre-layernorm architecture, this has to be done here.
@@ -362,65 +373,80 @@ class DecoderStack(nn.Module):
 
     # Reverse embedding to generate logits which predict the output tokens.
     logits = self.embed.attend(ys)  # (..., seq_len, vocab_size)
-    logging.info("dstack: logits = %r", logits)
+    logging.info("dstack: logits = %s", vshape(logits))
 
     # Normalize so that the range of logits is reasonable.
-    logits = logits / jnp.sqrt(logits.shape[-1]).astype(self.dtype)
+    logits = logits / jnp.sqrt(ys.shape[-1]).astype(self.dtype)
 
-    # Produce various visualizations in generate mode.
-    # TODO(delesley): Too many visualizations crashes the summary writer.
-    if self.mode == "generate":
-      img_dict = self._make_images(attn_viz_dicts, [])
-      hist_dict = {}  # metric_utils.make_histograms(attn_viz_dicts)
-      info_dict = {**img_dict, **hist_dict}
+    d_metrics = {}  # No additional metrics
+    if decoder_state is None:
+      return (logits, d_metrics)
     else:
-      info_dict = {}  # Don't output any visualizations.
+      # TODO(delesley): fix generation.
+      return (logits, decoder_state, d_metrics)   # For use by generate() only.
 
-    return (logits, decoder_state, info_dict)
+  def generate(self, inputs: Any, sequence_length: int) -> Array:
+    """Generate an output sequence.
 
-  def _make_importance_image(self, importance_list, scaled=True) -> Array:
-    rows = []
-    for imp in importance_list:
-      rows += [imp] * 8  # Rows are 8 pixels high for better visability.
-    image = jnp.stack(rows)
-    if scaled:
-      image = jnp.exp(image)
-    image = metric_utils.normalize_image(image, True)
-    return metric_utils.reshape_image(image)
+    Args:
+      inputs: the same as argument to _call_.
+      sequence_length: the length of sequence to generate.
 
-  def _make_images(self, viz_dicts, importance_list):
-    image_dict = {}
-    for (i, viz_dict) in enumerate(viz_dicts):
-      if "attn_importance_gate" in viz_dict:
-        imp_gate = viz_dict["attn_importance_gate"][0]  # First item in batch.
-        imp_strip = metric_utils.normalize_image(imp_gate[:, 0:8, :], True)
+    Returns:
+      An array of generated tokens of shape (batch_size, sequence_length).
+    """
+    # TODO(delesley): Add support for passing the prefix as an argument.
+    # TODO(delesley): Add support for temperature, gumbel softmax, beam search.
+
+    batch_size = self.task_config.batch_size
+    input_tokens = inputs["targets"]                  # [b,seq_len]
+    start_of_sequence = inputs["start_of_sequence"]   # [b]
+
+    # Initialize decoder.
+    dstate = self.init_decoder_state(sequence_length,
+                                     start_of_sequence)
+
+    # TODO(delesley): Handle start-of-sequence in a better way.
+    # There is no special token for start of sequence, so we grab the first
+    # one from the ground-truth input data.
+    first_token = input_tokens[:, 0:1]
+    no_start_of_seq = jnp.array([False] * batch_size, dtype=jnp.bool_)
+    sample_method = self.sample_method
+    sample_prng = self.make_rng("sample")
+
+    # Greedy autoregressive decoder function.
+    def loop_fn(scan_state: Any, i: Any) -> Tuple[Any, Array]:
+      prng = jax.random.fold_in(sample_prng, i)
+      (dstate, input_token) = scan_state
+      del i
+      (logits, dstate, _) = self.__call__(
+          inputs={
+              "input_tokens": input_token,
+              "start_of_sequence": no_start_of_seq,
+          },
+          decoder_state=dstate,
+          global_info={},
+      )
+      if sample_method == "sample":
+        logging.info("Using categorical sampling.")
+        output_token = jax.random.categorical(prng, logits, axis=-1)
+      elif sample_method == "greedy":
+        logging.info("Using greedy sampling.")
+        output_token = jnp.argmax(logits, axis=-1)
       else:
-        imp_strip = None
+        raise ValueError(f"Invalid sampling method: {sample_method}")
+      logging.info("generate_loop_fn: output_token = %s", vshape(output_token))
+      return ((dstate, output_token), output_token)
 
-      for (k, attn_images) in viz_dict.items():
-        if k not in {"attn_content",
-                     "attn_pre_softmax",
-                     "attn_log",
-                     "attn",
-                     "attn_position_bias",
-                     "attn_importance_bias",
-                     "attn_importance_gate"}:
-          continue
+    # Scan over the sequence length.
+    iterations = jnp.arange(sequence_length)
+    initial_scan_state = (dstate, first_token)
+    (_, output_tokens) = jax.lax.scan(loop_fn, initial_scan_state, iterations)
+    logging.info("generate: output_tokens = %s", vshape(output_tokens))
 
-        attn_img = attn_images[0]  # Grab the first item in the batch.
-        attn_img = metric_utils.normalize_image(attn_img,
-                                                as_group=(k != "attn"))
-        if imp_strip is not None and k in {"attn_log", "attn"}:
-          # Show importance bias in a strip at the bottom of the image.
-          attn_img = metric_utils.overlay_images(attn_img, imp_strip)
-        attn_img = metric_utils.reshape_image(attn_img)  # Returns None on fail.
-        if attn_img is not None:
-          image_dict[k + "_" + str(i)] = attn_img
-
-    if importance_list:
-      # Create an image out of the importance for each layer.
-      image_dict["importance_gate"] = self._make_importance_image(
-          importance_list, scaled=True)
-      image_dict["importance_raw"] = self._make_importance_image(
-          importance_list, scaled=False)
-    return image_dict
+    # Output_tokens has shape (sequence_length, batch_size, 1)
+    assert output_tokens.shape == (sequence_length, batch_size, 1)
+    output_tokens = jnp.reshape(
+        output_tokens, (sequence_length, self.task_config.batch_size))
+    output_tokens = output_tokens.transpose([1, 0])
+    return output_tokens

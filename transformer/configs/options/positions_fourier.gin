@@ -1,7 +1,2 @@
 
-transformer_layer.TransformerLayer:
-  relative_position_type = "fourier"
-
-decoder_stack.DecoderStack:
-  use_absolute_positions = False
-
+RELATIVE_POSITION_TYPE = "fourier"

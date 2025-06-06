@@ -1,4 +1,4 @@
-# Copyright 2022 Google.
+# Copyright 2025 Google.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,65 +15,105 @@
 """Gin configurable optimizer definitions.
 """
 
-from typing import Any, Optional
+from typing import Any, Callable, Iterable, Optional, Protocol, Union
 
 from absl import logging
-from flax import optim
-from flax import struct
+from flax import traverse_util
 import gin
+import jax
 import jax.numpy as jnp
+import  optimizer as meliad_optimizer
 import numpy as np
+import optax
 
 
-OptimizerDef = Any
+
+Optimizer = meliad_optimizer.Optimizer
+OptimizerDef = meliad_optimizer.OptimizerDef
 
 
-@struct.dataclass
-class OptimizerConfig:
+LearningRateScheduleFn = Callable[[jax.Array, int], jax.Array]
+
+
+class OptimizerConfig(Protocol):
   """Base class for optimizer configurations."""
 
-  learning_rate: float = 0.01    # All optimizers have a learning rate.
+  def learning_rate(self) -> float:  # All optimizers have a learning rate.
+    ...
 
   def create_optimizer_def(self) -> OptimizerDef:
-    raise ValueError("Not implemented.")
+    ...
 
 
 @gin.configurable
-@struct.dataclass
 class AdamConfig(OptimizerConfig):
   """Creates and configures the Adam optimizer."""
 
-  # Adam does not use parameter scale, and thus requires a smaller lrate.
-  # This will be multiplied by the learning rate schedule.
-  learning_rate: float = 0.05
+  def __init__(
+      self,
+      # Adam does not use parameter scale, and thus requires a smaller lrate.
+      # This will be multiplied by the learning rate schedule.
+      learning_rate: float = 0.05,
+      beta1: float = 0.9,   # Momentum, for moving average of gradient.
+      beta2: float = 0.98,  # For moving average of gradient magnitude.
+      weight_decay_rate: float = 0.0001,  # Relative to learning rate.
+  ):
+    self._learning_rate = learning_rate
+    self._beta1 = beta1
+    self._beta2 = beta2
+    self._weight_decay_rate = weight_decay_rate
 
-  beta1: float = 0.9               # For moving average of gradient.
-  beta2: float = 0.98              # For moving average of gradient magnitude.
-  weight_decay_rate: float = 0.0   # Relative to learning rate.
+  def learning_rate(self) -> float:
+    return self._learning_rate
 
-  def create_optimizer_def(self) -> optim.OptimizerDef:
+  def create_optimizer_def(self) -> OptimizerDef:
     logging.info("Using Adam Optimizer. lr=%f, b1=%f, b2=%f",
-                 self.learning_rate, self.beta1, self.beta2)
-    return optim.Adam(beta1=self.beta1,
-                      beta2=self.beta2,
-                      weight_decay=self.weight_decay_rate)
+                 self._learning_rate, self._beta1, self._beta2)
+
+    def opt_fn(learning_rate_fn):
+      # learning_rate_fn is a schedule that ties into the meliad training loop.
+      return optax.adamw(learning_rate=learning_rate_fn,
+                         b1=self._beta1,
+                         b2=self._beta2,
+                         weight_decay=self._weight_decay_rate)
+    return meliad_optimizer.OptimizerDef(opt_fn)
 
 
 @gin.configurable
-@struct.dataclass
-class FlaxAdafactorConfig(OptimizerConfig):
+class AdafactorConfig(OptimizerConfig):
   """Creates and configures the Adafactor optimizer."""
 
-  # Adafactor scales gradients according to parameter scale.
-  # This will be multiplied by the learning rate schedule.
-  learning_rate: float = 1.0
-  beta1: Optional[float] = 0.9      # Enables momentum with extra memory cost.
+  def __init__(
+      self,
+      # Adafactor scales gradients according to parameter scale.
+      # This will be multiplied by the learning rate schedule.
+      learning_rate: float = 1.0,
+      decay_rate: float = 0.8,          # Second moment exponential decay.
+      momentum: Optional[float] = 0.9,  # Enables momentum.
+      weight_decay_rate: Optional[float] = None,  # NOT relative to LR.
+  ):
+    self._learning_rate = learning_rate
+    self._decay_rate = decay_rate
+    self._momentum = momentum
+    self._weight_decay_rate = weight_decay_rate
 
-  def create_optimizer_def(self) -> optim.OptimizerDef:
-    # Use wd_lr_exponent to get weight_decay relative to learning rate.
-    logging.info("Using Flax Adafactor Optimizer. lr=%f, b1=%f",
-                 self.learning_rate, self.beta1)
-    return optim.Adafactor(beta1=self.beta1)
+  def learning_rate(self) -> float:
+    return self._learning_rate
+
+  def create_optimizer_def(self) -> OptimizerDef:
+    logging.info("Using Adafactor Optimizer. "
+                 "lr=%f, decay=%f, mom=%f, wdecay=%f",
+                 self._learning_rate, self._decay_rate, self._momentum,
+                 self._weight_decay_rate)
+
+    def opt_fn(learning_rate_fn):
+      # learning_rate_fn is a schedule that ties into the meliad training loop.
+      return optax.adafactor(learning_rate=learning_rate_fn,
+                             decay_rate=self._decay_rate,
+                             momentum=self._momentum,
+                             weight_decay_rate=self._weight_decay_rate,
+                             multiply_by_parameter_scale=True)
+    return meliad_optimizer.OptimizerDef(opt_fn)
 
 
 

@@ -1,0 +1,23 @@
+from transformer import position_nn
+
+RELATIVE_POSITION_TYPE = "orthogonal"
+
+position_nn.exponent_for_sequence:
+  sequence_length = %NUM_POSITION_BASIS_FUNCS
+  final_result = 256
+
+position_nn.asinh_exponential_translations:
+  basis_size = %NUM_POSITION_BASIS_FUNCS
+  exponent_base = @position_nn.exponent_for_sequence()
+
+position_nn.relu_exponential_translations:
+  basis_size = %NUM_POSITION_BASIS_FUNCS
+  exponent_base = @position_nn.exponent_for_sequence()
+
+position_nn.powers:
+  basis_size = %NUM_POSITION_BASIS_FUNCS
+
+position_nn.OrthogonalBasisPositionBias:
+  basis_size = %NUM_POSITION_BASIS_FUNCS
+
+

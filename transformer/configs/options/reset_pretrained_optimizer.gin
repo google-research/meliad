@@ -1,0 +1,4 @@
+import  model_info
+
+model_info.ModelInfo:
+  reset_pretrained_optimizer = True

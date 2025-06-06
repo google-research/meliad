@@ -1,0 +1,4 @@
+import  model_info
+
+model_info.ModelInfo:
+  checkify_mode = %model_info.CheckifyMode.USER_CHECKS

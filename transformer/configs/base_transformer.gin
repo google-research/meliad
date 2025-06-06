@@ -1,0 +1,110 @@
+# Base configuration for the vanilla transformer and transformer-XL.
+
+include "trainer_configuration.gin"
+
+# Imports
+import  model_base
+from transformer import attention
+from transformer import language_model
+from transformer import model_runner
+from transformer import nn_components
+from transformer import transformer_layer
+from transformer import transformer_stack
+from transformer import transformer_base
+
+
+NUM_LAYERS = 12
+NUM_HEADS = 8
+HEAD_DIM = 128
+EMBED_DIM = 1024       # Size of embedding vector for each token
+MLP_DIM = 4096         # Number of hidden units in transformer FFN
+
+NUM_EMBEDDINGS = 256   # Number of tokens in vocabulary.
+SEGMENT_LENGTH = 512
+WINDOW_LENGTH = 512
+USE_LONG_XL_ARCHITECTURE = True
+
+RELATIVE_POSITION_TYPE = "t5"       # Can be "fourier", "t5", or None.
+DROPOUT_RATE = 0.05
+ATTN_DROPOUT_RATE = 0.05
+
+# For training on TPU.
+DTYPE="bfloat16"
+
+# Configure the input task.
+language_model.TransformerTaskConfig:
+  dataset_name = "synthetic"
+  train_split = "train"
+  test_split = "test"
+  sequence_length = %SEGMENT_LENGTH
+  batch_size = 8
+  vocab_size = %NUM_EMBEDDINGS
+
+training_loop.Trainer:
+  model_definition = @model_runner.DecoderOnlyLanguageModelRunner
+  num_test_steps = 400
+
+
+# DecoderOnlyLanguageModelRunner implements model_info.ModelBase.
+# It defines inputs, outputs, and various metrics that are common to all
+# language models.  It wraps another ModelBase object.
+model_runner.DecoderOnlyLanguageModelRunner:
+  task_config = @language_model.TransformerTaskConfig()
+  decoder_factory = @decoder_only_lm/model_base.FlaxModuleModel
+
+# Lightweight adaptor that implements ModelBase, and wraps a flax module.
+# (Necessary for compatibility with other adaptors, e.g. for T5X.)
+decoder_only_lm/model_base.FlaxModuleModel:
+  flax_module_factory = @transformer_stack.DecoderStack
+
+# A stack of transformer layers.
+transformer_stack.DecoderStack:
+  # task_config will be passed in from DecoderOnlyLanguageModel.
+  embedding_dim = %EMBED_DIM
+  stack_factory = @transformer_stack.TransformerStack
+  final_dropout_rate = %DROPOUT_RATE  # Dropout before token lookup.
+  dtype = %DTYPE
+
+transformer_stack.TransformerStack:
+  num_layers = %NUM_LAYERS
+  layer_factory = @transformer_layer.TransformerLayer
+  side_layer_factory = None
+  side_layer_indices = ()
+
+transformer_layer.TransformerLayer:
+  transformer_base_factory = @transformer_base.TransformerBase
+  num_heads = %NUM_HEADS
+  head_size = %HEAD_DIM
+  mlp_dim = %MLP_DIM
+  window_length = %WINDOW_LENGTH
+  use_long_xl_architecture = %USE_LONG_XL_ARCHITECTURE
+  parallel_windowed_attention = True
+  relative_position_type = %RELATIVE_POSITION_TYPE
+  use_causal_mask = True
+  attn_dropout_rate = %ATTN_DROPOUT_RATE   # Attention matrix dropout.
+
+transformer_base.TransformerBase:
+  attn_mlp_factory = @transformer_attn/nn_components.MLP
+  ffn_factory = @transformer_ffn/nn_components.MLP
+  normalize_keys = True               # More stable with Transformer XL.
+  dropout_rate = %DROPOUT_RATE
+  pre_attn_dropout = True
+  post_attn_dropout = False
+  pre_ffn_dropout = False
+  post_ffn_dropout = True
+
+transformer_attn/nn_components.MLP:
+  num_layers = 1                      # Just a single dense matmul.
+  hidden_activation = None
+  use_bias = False
+
+transformer_ffn/nn_components.MLP:
+  num_layers = 2
+  hidden_activation = "relu"
+  use_bias = False
+
+nn_components.LayerNorm:
+  use_scale = True
+  use_bias = False
+  use_mean = False   # Calculate and adjust for the mean as well as the scale.
+  dtype = %DTYPE

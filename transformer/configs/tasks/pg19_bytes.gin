@@ -2,8 +2,8 @@
 NUM_EMBEDDINGS = 260
 
 # Configure the input task.
-decoder_stack.TransformerTaskConfig:
+language_model.TransformerTaskConfig:
   dataset_name = "pg19_bytes"
 
 training_loop.Trainer:
-  num_steps = 500_000
+  num_steps = 100_000

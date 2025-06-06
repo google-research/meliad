@@ -1,0 +1,13 @@
+include "options/positions_orthogonal.gin"
+
+NUM_POSITION_BASIS_FUNCS = 7
+
+position_nn.exponent_for_sequence:
+  final_result = 64
+
+position_nn.asinh_exponential_translations:
+  exponent_base = @position_nn.exponent_for_sequence()
+
+position_nn.OrthogonalBasisPositionBias:
+  initial_basis_functions = @position_nn.asinh_exponential_translations
+  orthogonality_range = (0, 1024, 4096)

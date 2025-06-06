@@ -1,27 +1,31 @@
-# Tiny config for testing purposes.
+# Tiny config for testing purposes on CPU.
 
-NUM_LAYERS = 2
-EMBED_DIM = 128
-NUM_HEADS = 4
-HEAD_DIM = 32
-MLP_DIM = 256
-DROPOUT_RATE = 0.1
-ATTN_DROPOUT_RATE = 0.1
+NUM_LAYERS = 3
+EMBED_DIM = 32
+NUM_HEADS = 2
+HEAD_DIM = 16
+MLP_DIM = 64
 
-decoder_stack.TransformerTaskConfig:
-  sequence_length = 256
+SEGMENT_LENGTH = 32  # 2 windows
+WINDOW_LENGTH = 16
+USE_LONG_XL_ARCHITECTURE = True
+
+# For use by base_memory2.gin
+MEMORY_LAYER_INDICES = (1,)
+SIDE_LAYER_MLP_DIM = 128
+
+language_model.TransformerTaskConfig:
+  dataset_name = "synthetic"
+  sequence_length = %SEGMENT_LENGTH
   batch_size = 1
 
-transformer_layer.TransformerLayer:
-  window_length = 128
-  use_long_xl_architecture = True
-
 training_loop.Trainer:
-  num_steps = 1000
-  warmup_steps = 100
-  log_every_steps = 10
+  num_steps = 100
+  warmup_steps = 20
+  log_every_steps = 1
   test_every_steps = 10
   num_test_steps = 1
-  generate_every_steps = 100
-  print_input_every_steps = 100
+  generate_every_steps = 0
+  print_input_every_steps = 50
+  parameter_metrics_every_steps = 200
   checkpoint_every_steps = 100

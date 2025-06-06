@@ -1,7 +1,6 @@
 
-transformer_layer.TransformerLayer:
-  relative_position_type = None
+RELATIVE_POSITION_TYPE = None
 
+# Only implemented when using memory/DecoderStack
 decoder_stack.DecoderStack:
   use_absolute_positions = True
-

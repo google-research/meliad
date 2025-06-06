@@ -1,0 +1,4 @@
+
+# Enable Fourier positions for the wrapper around p5x.
+t5_architecture.DecoderLayer:
+  relative_position_bias_factory = @position_fourier.RelativeFourierPositions

@@ -1,4 +1,4 @@
-# Copyright 2022 Google.
+# Copyright 2025 Google.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,13 +14,13 @@
 
 """Flax modules and functions for using external memory."""
 
-from typing import Any, Optional, Tuple
+from typing import Any, Optional, Sequence, Tuple
 
 from absl import logging
 from flax import linen
 import gin
 import jax
-from transformer import memory_layer
+from transformer.memory import memory_layer
 
 
 
@@ -46,7 +46,8 @@ class MemoryManager:
                value_size: int,
                database_size: Optional[int] = None,
                dtype: Dtype = "float32",
-               off_device_memory: Optional[MemoryResource] = None):
+               off_device_memory: Optional[MemoryResource] = None,
+               cross_batch_memory: bool = True):
     """Create a MemoryManager object.
 
     A MemoryManager configures external memory, and is used as a factory to
@@ -62,7 +63,12 @@ class MemoryManager:
       dtype:      The datatype used for keys and values.
       off_device_memory: An object which manages underlying SCAM memory.
           If None, then the model will use on-device memory.
+      cross_batch_memory: Whether memory should be shared between sequences in
+          the same batch.
     """
+    if not cross_batch_memory:
+      assert off_device_memory is None
+    self.cross_batch_memory = cross_batch_memory
     self.batch_size = batch_size
     self.mode = mode
     self.num_heads = num_heads
@@ -74,11 +80,9 @@ class MemoryManager:
 
   def create_memory_layer(self) -> linen.Module:
     """Create a flax Module that implements external memory."""
-
     num_datasets = (
-        self.batch_size * self.num_heads  #
-        if self.off_device_memory is None  #
-        else self.num_heads)
+        self.num_heads if self.cross_batch_memory  #
+        else self.batch_size * self.num_heads)
     if self.off_device_memory is not None:
       mem_layer = None
       if mem_layer is None:
@@ -89,14 +93,31 @@ class MemoryManager:
       )
     else:
       assert self.database_size is not None
-      mem_layer = memory_layer.MemoryOnTpu(num_datasets=num_datasets,
-                                           key_features=self.key_size,
-                                           value_features=self.value_size,
-                                           database_size=self.database_size,
-                                           dtype=self.dtype)
+      split_dimensions: Sequence[int] = (0, -2)
+      disallow_reset_because: str = ""
+      database_size = self.database_size  # database_size modified below
+      if self.cross_batch_memory:
+        # We want self.database_size to represent the number of stored
+        # tokens *per batch element*.
+        database_size *= self.batch_size
+        split_dimensions = (-2,)
+        disallow_reset_because = (
+            "Memory is shared between documents. Therefore you should not "
+            "reset all memory whenever a single document ends. Relevant gin "
+            "config settings: memory_on_tpu_factory.cross_batch_memory, "
+            "TransformerLayer.memory_reset_on_new_doc."
+        )
+      mem_layer = memory_layer.MemoryOnTpu(
+          num_datasets=num_datasets,
+          key_features=self.key_size,
+          value_features=self.value_size,
+          database_size=self.database_size,
+          dtype=self.dtype,
+          disallow_reset_because=disallow_reset_because,
+      )
     # Handle queries of shape [batch_size, seq_len, num_heads, kv_features]
     return memory_layer.BatchedMemory(mem_layer,
-                                      split_dimensions=(0, -2))
+                                      split_dimensions=split_dimensions)
 
 
 @gin.configurable
@@ -106,7 +127,8 @@ def memory_on_tpu_factory(batch_size: int,
                           key_size: int = gin.REQUIRED,
                           value_size: int = gin.REQUIRED,
                           database_size: int = gin.REQUIRED,
-                          dtype: Dtype = gin.REQUIRED) -> MemoryManager:
+                          dtype: Dtype = gin.REQUIRED,
+                          cross_batch_memory: bool = False) -> MemoryManager:
   """Implement SCAM memory on device."""
   return MemoryManager(batch_size=batch_size,
                        mode=mode,
@@ -115,6 +137,7 @@ def memory_on_tpu_factory(batch_size: int,
                        value_size=value_size,
                        database_size=database_size,
                        dtype=dtype,
-                       off_device_memory=None)
+                       off_device_memory=None,
+                       cross_batch_memory=cross_batch_memory)
 
 

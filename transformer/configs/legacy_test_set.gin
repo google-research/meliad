@@ -1,0 +1,13 @@
+# This gin file reverts the training loop behavior to testing on random bits of
+# the test set. The default behavior is that we test on the initial part of the
+# test set and avoid shuffling. This reduces the noise and improves
+# comparability between different experiments.
+
+import  training_loop
+from transformer import text_dataset
+
+text_dataset.load_text_dataset:
+  shuffle_splits = ("train", "test",)
+
+training_loop.Trainer:
+  reset_test_task = False

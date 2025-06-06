@@ -1,4 +1,4 @@
-# Copyright 2022 Google.
+# Copyright 2025 Google.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -23,23 +23,23 @@ from typing import Any, Dict, Optional, Sequence, Tuple
 from absl import logging
 import gin
 import jax
+import  model_info
 import  training_loop
-from transformer import decoder_stack
-from transformer import models
+from transformer import language_model
 from transformer import text_dataset
 import numpy as np
 import seqio
 
 
+ModelInfo = model_info.ModelInfo
+TrainState = model_info.TrainState
+Metrics = model_info.Metrics
 Trainer = training_loop.Trainer
-TrainState = training_loop.TrainState
 TrainingTask = training_loop.TrainingTask
-PRNGKeys = training_loop.PRNGKeys
 
 ModelInput = Dict[str, Any]     # Input to model.
-MetricsOutput = Dict[str, Any]  # Metrics output by model.
-ArticleData = Tuple[Sequence[ModelInput], seqio.Vocabulary]
-TaskState = Tuple[TrainState, int]
+ArticleData = Sequence[ModelInput]
+ArticleList = Sequence[ArticleData]
 
 
 DEFAULT_GIN_PATHS = [
@@ -77,16 +77,23 @@ def parse_gin_configuration(gin_files: Optional[Sequence[str]],
   gin.parse_config_files_and_bindings(gin_files, gin_params)
 
 
-def read_article(split: Optional[str] = None,
-                 verbose: bool = False) -> ArticleData:
-  """Read a single article from the dataset and save it as a list of blocks.
+def read_articles(split: Optional[str] = None,
+                  verbose: bool = False,
+                  random_seed: int = 42,
+                  num_articles: int = 1,
+                 ) -> Tuple[ArticleList, seqio.Vocabulary]:
+  """Read one or more articles from the dataset.
 
-  This routine will return blocks for a single article; so the tokens will
-  have a batch size of 1. The blocks can be fed to the model directly as input.
+  This routine will read one or more articles from the data set.
+  Each article consists of a list of segments.  Each segment can be fed to the
+  model directly as input.
 
   Args:
     split: The dataset split to load from.  Defaults to the test split.
     verbose: If True, will dump the contents of the article to the log.
+    random_seed: The random seed to use when shuffling the dataset.
+                 Specifying the same seed should yield the same data.
+    num_articles: The number of articles to return.
 
   Returns:
     A pair of (list_of_blocks, vocabulary)
@@ -95,7 +102,7 @@ def read_article(split: Optional[str] = None,
   logging.info("Reading article.")
 
   text_dataset.set_default_data_directory()
-  task_config = decoder_stack.TransformerTaskConfig()
+  task_config = language_model.TransformerTaskConfig()
   batch_size = 1
 
   if split is None:
@@ -107,7 +114,11 @@ def read_article(split: Optional[str] = None,
       sequence_length=task_config.sequence_length,
       batch_size=batch_size,
       sequential=task_config.sequential_chunks,
-      shard_dataset=False)
+      num_shards=1,
+      shard_id=0,
+      # In a colab, specify random_seed to avoid hanging on multihost broadcast.
+      random_seed=random_seed,
+  )
 
   logging.info("Configured vocab_size = %d", task_config.vocab_size)
   logging.info("Task vocabulary size = %d", vocab.vocab_size)
@@ -116,6 +127,7 @@ def read_article(split: Optional[str] = None,
         "Task vocabulary size does not match configured vocab_size: " +
         f"{task_config.vocab_size} < {vocab.vocab_size}")
 
+  articles = []
   article_segments = []
   ds_iter = test_ds.as_numpy_iterator()
   vocab_map = {"targets": vocab}
@@ -128,10 +140,15 @@ def read_article(split: Optional[str] = None,
       logging.info("End of epoch? Something went wrong.")
       break
 
-    # Make sure we've started reading, otherwise it immediately quits...
-    if article_segments:
-      if x["start_of_sequence"][0]:
-        break
+    if x["start_of_sequence"][0]:
+      # Wait until we've at least started reading the first article.
+      if article_segments:
+        # Add old article to the list, and start a new one.
+        articles.append(article_segments)
+        if len(articles) >= num_articles:
+          # The primary exit route from the `while True` loop:
+          break
+        article_segments = []
 
     if verbose:
       logging.info("Segment %d = %s", segment_num,
@@ -142,12 +159,13 @@ def read_article(split: Optional[str] = None,
 
   logging.info("Done reading article: %d segments.", segment_num)
   logging.info("Num tokens = %d", segment_num * task_config.sequence_length)
-  return (article_segments, vocab)
+  return (articles, vocab)
 
 
-def create_model_and_task(vocab: seqio.Vocabulary,
-                          load_dir: Optional[str] = None) -> (
-                              Tuple[TrainingTask, TaskState, Trainer]):
+def create_model_and_task(
+    vocab: seqio.Vocabulary,
+    load_dir: Optional[str] = None,
+) -> Tuple[TrainingTask, TrainState, ModelInfo, Trainer]:
   """Initialize the model and get a task for inference.
 
   The task will be configured to take test (inference) steps with the model.
@@ -158,62 +176,72 @@ def create_model_and_task(vocab: seqio.Vocabulary,
     load_dir: A directory which contains a pre-trained model.
 
   Returns:
-    (task -- has a run_step method to take individual steps with the model,
-     state -- contains trainable parameters and other state,
-     trainer -- a Trainer object (see training_loop.py))
+    (task -- Has a run_step method to take individual steps with the model,
+     tstate -- The TrainState object with trainable parameters,
+     mdl_info -- A ModelInfo object (see model_info.py),
+     trainer -- a Trainer object (see training_loop.py),
+    )
   """
 
   logging.info("JAX process: %d / %d", jax.process_index(), jax.process_count())
   logging.info("JAX local devices: %r", jax.local_devices())
 
   # This task won't be pulling from a dataset.
-  def null_iter_fn():
+  def get_dataset_iterator(mode: str, num_shards: int, shard_id: int,
+                           batch_size_per_shard: int):
+    del mode, num_shards, shard_id, batch_size_per_shard
     return None
 
+  # Create a trainer object.
   trainer = training_loop.Trainer(
-      get_training_dataset_iterator=null_iter_fn,
-      get_test_dataset_iterator=None,
+      batch_size_per_replica=1,
+      get_dataset_iterator_function=get_dataset_iterator,
       pretty_print_input_function=None,
-      process_summaries_function=models.process_summaries_function(vocab),
+      process_summaries_function=(
+          language_model.process_summaries_function(vocab)),
       load_dir=load_dir,
-      workdir="",            # Don't log or save checkpoints.
-      replicate_mode=False)  # Run on a single device at batch size 1.
+      workdir="")             # Don't log or save checkpoints.
+  # What follows is a reimplementation of parts of trainer.train()
 
   # Create and initialize the model.
-  (tstate, start_step, imodel, prngs) = trainer.initialize_model()
+  mdl_info = trainer.create_model_info()
+  tstate = mdl_info.initialize_model()
 
-  # Create an inference task.
+  # Create a training task.
   writers = {}
-  task = trainer.create_training_task("test", imodel, prngs, writers)
+  task = trainer.create_training_task("train", mdl_info, writers)
 
   # Register any additional actions.
   # Actions are cleared first for use with colab.
   training_loop.clear_interstep_callbacks()
   training_loop.register_interstep_callbacks()
 
-  task_state = (tstate, start_step)
-  return (task, task_state, trainer)
+  return (task, tstate, mdl_info, trainer)
 
 
-def run_model(task: TrainingTask, task_state: TaskState,
-              article_data: ArticleData, verbose: bool = False) -> (
-                  Sequence[MetricsOutput]):
+def run_model(task: TrainingTask,
+              tstate: TrainState,
+              article_segments: ArticleData,
+              vocab: seqio.Vocabulary,
+              start_step: int = 0,
+              verbose: bool = False,
+             ) -> Tuple[Sequence[Metrics], TrainState]:
   """Run the model on an article, and return the outputs for each segment.
 
   Args:
     task: The task to run, from create_model_and_task.
-    task_state: The state of the model, from create_model_and_task.
-    article_data: The article and vocabulary, from read_article.
+    tstate: A TrainState for the model, from create_model_and_task.
+    article_segments: An article returned from read_article.
+    vocab: The vocabulary used for the article.
+    start_step: The starting step number to use.  (E.g. mdl_info.step)
     verbose: If True, will send input and output to the log.
 
   Returns:
-    A sequence of model outputs for each block.
+    A sequence of model outputs for each block, and a new TrainState.
   """
 
   logging.info("Running the model.")
 
-  (article_segments, vocab) = article_data
-  (tstate, start_step) = task_state
   vocab_map = {"targets": vocab}
 
   # Ignore the iterator for the test task, and loop over the article.
@@ -242,7 +270,7 @@ def run_model(task: TrainingTask, task_state: TaskState,
     step += 1
 
   logging.info("Done running the model: %d segments.", segment_num)
-  return segment_outputs
+  return (segment_outputs, tstate)
 
 
 def get_token_losses(segment_outputs: Sequence[Any]) -> np.ndarray:

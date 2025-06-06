@@ -1,7 +1,4 @@
 
-transformer_layer.TransformerLayer:
-  relative_position_type = "rotary"
+RELATIVE_POSITION_TYPE = "rotary"
 
-decoder_stack.DecoderStack:
-  use_absolute_positions = False
 

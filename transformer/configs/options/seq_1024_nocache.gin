@@ -1,8 +1,0 @@
-
-decoder_stack.TransformerTaskConfig:
-  sequence_length = 1024
-  batch_size = 4
-
-transformer_layer.TransformerLayer:
-  window_length = 1024
-  use_long_xl_architecture = False

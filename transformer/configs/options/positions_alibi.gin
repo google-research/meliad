@@ -1,0 +1,11 @@
+from jax.nn import initializers
+from transformer import position_alibi
+
+RELATIVE_POSITION_TYPE = "alibi"
+
+# Initialize bounds to a constant value of 1.0.
+bound_initializer/initializers.constant:
+  value = 1.0
+position_alibi.BoundedALiBi:
+  bound_initializer = @bound_initializer/initializers.constant()
+

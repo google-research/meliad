@@ -1,0 +1,7 @@
+SEGMENT_LENGTH = 2048
+WINDOW_LENGTH = 2048
+USE_LONG_XL_ARCHITECTURE = False
+
+language_model.TransformerTaskConfig:
+  sequence_length = %SEGMENT_LENGTH
+  batch_size = 2

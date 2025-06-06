@@ -1,7 +1,4 @@
 
-transformer_layer.TransformerLayer:
-  relative_position_type = "t5"
+RELATIVE_POSITION_TYPE = "t5"
 
-decoder_stack.DecoderStack:
-  use_absolute_positions = False
 

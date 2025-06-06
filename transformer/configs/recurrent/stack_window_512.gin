@@ -1,0 +1,4 @@
+WINDOW_LENGTH = 512
+
+decoder_stack.DecoderStack:
+  dstack_window_length = 512

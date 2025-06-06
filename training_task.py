@@ -1,4 +1,4 @@
-# Copyright 2022 Google.
+# Copyright 2025 Google.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,32 +15,30 @@
 """TrainingTask encapsulates the state associated with model step."""
 
 import time
-from typing import (Any, Callable, Dict, Iterator, Mapping, Optional, Tuple)
+from typing import (Any, Callable, Mapping, Optional, Tuple)
 
 from absl import logging
 from clu import metric_writers
-from flax import optim
-from flax import struct
 import jax
 import  metrics_summary
-import numpy as np
+import  model_info
 
 
-@struct.dataclass
-class TrainState:
-  optimizer: optim.Optimizer   # Trainable parameters.
-  state: Any                   # Other state, e.g. XL cache or memory.
-
-
-PRNGKeys = Any
-Metrics = Dict[str, Any]
+TrainState = model_info.TrainState
+Dataset = model_info.Dataset
+Metrics = model_info.Metrics
 MetricsSummary = metrics_summary.MetricsSummary
+StepFunction = model_info.StepFunction
+ModelInfo = model_info.ModelInfo
 
-Dataset = Callable[[], Iterator[Any]]
-StepFunction = Callable[[TrainState, Any, Any], Tuple[TrainState, Metrics]]
+
 PrettyPrintInputFunction = Optional[Callable[[Any], str]]
 ProcessSummariesFunction = Optional[Callable[[Any, str], Any]]
 ExtraSummariesFunction = Optional[Callable[[str, int], Mapping[str, Any]]]
+
+
+average_metric_np = metrics_summary.average_metric_np
+text_metric = metrics_summary.text_metric
 
 
 def should_run(step: int, every_steps: int) -> bool:
@@ -60,15 +58,14 @@ class TrainingTask:
       self,
       *,  # Pass arguments by keyword only.
       mode: str,
-      dataset: Dataset,
+      dataset: Optional[Dataset],
       step_function: StepFunction,
-      prng_keys: PRNGKeys,
+      mdl_info: ModelInfo,
       summary: MetricsSummary,
       extra_summary: MetricsSummary,
       summary_writer: metric_writers.MetricWriter,
       summary_prefix: str = "",
       # --- Options from TrainingLoop ---
-      replicate_mode: bool = True,
       print_input_every_steps: int = 0,
       pretty_print_input_function: PrettyPrintInputFunction = None,
       process_summaries_function: ProcessSummariesFunction = None,
@@ -77,14 +74,13 @@ class TrainingTask:
     self.mode = mode
     self.dataset = dataset
     self.step_function = step_function
-    self.prng_keys = prng_keys
+    self.model_info = mdl_info
     self.summary = summary
     self.extra_summary = extra_summary
     self.summary_writer = summary_writer
     self.summary_prefix = summary_prefix
 
     # Options carried over from TrainingLoop.
-    self.replicate_mode = replicate_mode
     self.print_input_every_steps = print_input_every_steps
     self.pretty_print_input_fn = pretty_print_input_function
     self.process_summaries_fn = process_summaries_function
@@ -95,15 +91,16 @@ class TrainingTask:
       self.ds_iterator = self.dataset()
     self.epoch = 0
 
-  def _get_metrics(self, device_metrics: Metrics) -> Metrics:
-    """Read a dictionary of metrics from device."""
-    if self.replicate_mode:
-      # x[0] gets the metric from device 0 -- the first replica.
-      # We assume that merge_replicated_metrics has already combined the
-      # metrics from multiple devices.
-      device_metrics = jax.tree_map(lambda x: x[0], device_metrics)
-    metrics_np = jax.device_get(device_metrics)  # Get numpy arrays.
-    return metrics_np
+  def _get_first_input(self, x: Any) -> Any:
+    """Grab the first input in a batch of inputs."""
+    return jax.tree.map(lambda x: x[0], x)
+
+  def reset_dataset(self):
+    logging.info("Resetting dataset for mode %s.", self.mode)
+    if self.dataset is None:
+      logging.warning("No dataset for mode %s", self.mode)
+      return
+    self.ds_iterator = self.dataset()
 
   def get_next_input(self) -> Any:
     """Grab the next input from the data pipeline."""
@@ -115,7 +112,7 @@ class TrainingTask:
       x = next(self.ds_iterator)
     except StopIteration:
       logging.info("End of epoch %d for mode %s.", self.epoch, self.mode)
-      self.ds_iterator = self.dataset()
+      self.reset_dataset()
       x = next(self.ds_iterator)
       self.epoch += 1
     return x
@@ -138,31 +135,31 @@ class TrainingTask:
 
     start_time = time.perf_counter()
 
-    # Split a batch of inputs among local replicas.
-    if self.replicate_mode:
-      x = split_batch_dimension(x, jax.local_device_count())
-
     # Pretty-print the input to the summary and log file every so often.
     if (sub_step == 0 and self.pretty_print_input_fn is not None and
         should_run(step, self.print_input_every_steps)):
-      x_first = jax.tree_map(lambda x: x[0], x) if self.replicate_mode else x
+      x_first = self._get_first_input(x)
       x_strs = self.pretty_print_input_fn(x_first)
       logging.info("[%d] Input (%s) = %s", step, self.mode, x_strs)
-      self.summary.add_text({"input": x_strs})
+      self.summary.merge({"input": text_metric(x_strs)})
 
     # Run the step function on the input.
     with jax.profiler.StepTraceAnnotation(self.mode, step_num=step):
-      (tstate, metrics) = self.step_function(tstate, x, self.prng_keys)
+      x_device = self.model_info.copy_input_to_devices(x)
+      (tstate, metrics) = self.step_function(tstate, x_device)
 
     # Read metrics from device.
-    metrics_np = self._get_metrics(metrics)
+    metrics_np = self.model_info.read_metrics_from_device(metrics)
     end_time = time.perf_counter()
-    metrics_np["step_time"] = end_time - start_time
+    metrics_np["step_time"] = average_metric_np(end_time - start_time)
     if "epoch" not in metrics_np.keys():
-      metrics_np["epoch"] = self.epoch
+      metrics_np["epoch"] = average_metric_np(self.epoch)
+
+    # Uncommment this line to print verbose metrics for debugging.
+    # metrics_summary.log_metric_values(metrics_np)
 
     # Add metrics to the current summary.
-    self.summary.add(metrics_np)
+    self.summary.merge(metrics_np)
     return (tstate, metrics_np)
 
   def flush(self, step: int):
@@ -170,9 +167,6 @@ class TrainingTask:
 
     if self.summary_writer is None:
       self.summary.clear()  # Clear summary if we can't write it.
-      return
-
-    if self.summary.empty():
       return
 
     # Do post-processing of the summaries.
@@ -185,32 +179,6 @@ class TrainingTask:
 
     # Add extra summaries that are not computed by the step function.
     if self.extra_summaries_fn is not None:
-      self.extra_summary.add(self.extra_summaries_fn(self.mode, step))
+      self.extra_summary.merge(self.extra_summaries_fn(self.mode, step))
       self.extra_summary.write(self.summary_writer, step, prefix="")
 
-
-def split_batch_dimension(inputs: Any, num_replicas: int) -> Any:
-  """Splits the leading batch dimension.
-
-  Given inputs of shape [num_replicas * batch_size, ...], it will reshape
-  them to [num_replicas, batch_size, ...].  This operation is intended to be
-  used right before calling pmap, which will eliminate the num_replicas
-  dimension.
-
-  Args:
-    inputs: Tuple of inputs to split.
-    num_replicas: Number of replicas.
-
-  Returns:
-    inputs with extra batch dimension.
-  """
-
-  def split_batch_dim(x):
-    assert x.ndim > 0
-    if (x.shape[0] % num_replicas) != 0:
-      raise ValueError(f"Can't split {x.shape} into {num_replicas} replicas.")
-    batch_size = x.shape[0] // num_replicas
-    split_shape = [num_replicas, batch_size] + list(x.shape[1:])
-    return np.reshape(x, split_shape)
-
-  return jax.tree_map(split_batch_dim, inputs)

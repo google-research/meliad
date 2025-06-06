@@ -1,5 +1,0 @@
-
-DTYPE="float32"  # Required when using scan for stability.
-
-transformer_layer.TransformerLayer:
-  max_unrolled_windows = 0   # Never unroll.

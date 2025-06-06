@@ -1,4 +1,4 @@
-# Copyright 2022 Google.
+# Copyright 2025 Google.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,6 +15,7 @@
 """Add Tasks to registry."""
 
 import functools
+from typing import Dict, Optional
 
 from transformer import text_dataset
 import seqio
@@ -23,7 +24,10 @@ from t5.data import preprocessors
 import tensorflow as tf
 
 
-TaskRegistry = seqio.TaskRegistry
+def _features_from_vocab(vocab: seqio.Vocabulary) -> Dict[str, seqio.Feature]:
+  return {
+      "targets": seqio.Feature(vocabulary=vocab, add_eos=False, dtype=tf.int32)
+  }
 
 
 def define_pg19_task(name: str, vocab: seqio.Vocabulary):
@@ -38,15 +42,11 @@ def define_pg19_task(name: str, vocab: seqio.Vocabulary):
                             keep={"book_title", "book_id", "publication_date"}),
           seqio.preprocessors.tokenize,
       ],
-      output_features={
-          "targets": seqio.Feature(vocab,
-                                   add_eos=False, dtype=tf.int32),
-      }
+      output_features=_features_from_vocab(vocab)
   )
-
 
 T5_DEFAULT_VOCABULARY = t5.data.get_default_vocabulary()
 define_pg19_task("pg19_bytes", seqio.ByteVocabulary())
-define_pg19_task("pg19_tokens", T5_DEFAULT_VOCABULARY)
+define_pg19_task("pg19_tokens_t5", T5_DEFAULT_VOCABULARY)
 
 

@@ -1,0 +1,123 @@
+# Base configuration for CorpusMind experiments with trainable memory.
+
+include "trainer_configuration.gin"
+
+# Imports
+import  model_base
+from transformer import attention
+from transformer import language_model
+from transformer import model_runner
+from transformer import nn_components
+from transformer import transformer_base
+from transformer import transformer_stack
+from transformer import transformer_layer
+from transformer.memory2 import dense_kv_memory
+from transformer.memory2 import recurrent_memory_layer
+from transformer.memory2 import melodi_layer
+
+NUM_LAYERS = 12
+EMBED_DIM = 1024       # Length of the embedding vector for each token.
+NUM_HEADS = 8
+HEAD_DIM = 128
+MLP_DIM = 4096         # Number of hidden units in the transformer FFN.
+NUM_EMBEDDINGS = 256   # Number of tokens in the vocabulary.
+
+MEMORY_LAYER_INDICES = (6,)
+SIDE_LAYER_MLP_DIM = 65536
+
+SEGMENT_LENGTH = 4096
+WINDOW_LENGTH = 512                 # 8 windows
+USE_LONG_XL_ARCHITECTURE = True
+RELATIVE_POSITION_TYPE = "t5"       # Can be "fourier", "t5", or None.
+DROPOUT_RATE = 0.05
+ATTN_DROPOUT_RATE = 0.05
+
+# For training on TPU.
+DTYPE="bfloat16"
+
+# Configure the input task -- the default is "synthetic" for testing.
+language_model.TransformerTaskConfig:
+  dataset_name = "synthetic"
+  train_split = "train"
+  test_split = "test"
+  sequence_length = %SEGMENT_LENGTH
+  batch_size = 1
+  vocab_size = %NUM_EMBEDDINGS
+
+# Entry point: defines what model we are running.
+training_loop.Trainer:
+  model_definition = @model_runner.DecoderOnlyLanguageModelRunner
+
+
+# DecoderOnlyLanguageModelRunner implements model_info.ModelBase.
+# It defines inputs, outputs, and various metrics that are common to all
+# language models.  It wraps another ModelBase object.
+model_runner.DecoderOnlyLanguageModelRunner:
+  task_config = @language_model.TransformerTaskConfig()
+  decoder_factory = @decoder_only_lm/model_base.FlaxModuleModel
+
+# Lightweight adaptor that implements ModelBase, and wraps a flax module.
+# (Necessary for compatibility with other adaptors, e.g. for T5X.)
+decoder_only_lm/model_base.FlaxModuleModel:
+  flax_module_factory = @transformer_stack.DecoderStack
+
+# A stack of transformer layers.
+transformer_stack.DecoderStack:
+  # task_config will be passed in from DecoderOnlyLanguageModel.
+  embedding_dim = %EMBED_DIM
+  # stack_factory = @transformer_stack.TransformerStack
+  stack_factory = @ordinary/melodi_layer.MelodiStack
+  final_dropout_rate = %DROPOUT_RATE  # Dropout before token lookup.
+  dtype = %DTYPE
+
+# Melodi Stack
+ordinary/melodi_layer.MelodiStack:
+  num_layers = %NUM_LAYERS
+  window_length = %WINDOW_LENGTH
+  layer_factory = @ordinary/melodi_layer.MelodiSequenceLayer
+  # layer_factory = None
+  long_term_memory_layer_indices = %MEMORY_LAYER_INDICES
+  long_term_memory_size = 4096
+  long_term_memory_increment_size = 32
+  short_term_memory_size = 64
+  memory_embedding_dim = 0
+  summary_size = 64
+
+# Melodi Sequence Layer
+ordinary/melodi_layer.MelodiSequenceLayer:
+  num_heads = %NUM_HEADS
+  head_size = %HEAD_DIM
+  mlp_dim = %MLP_DIM
+  window_length = %WINDOW_LENGTH
+  relative_position_type = %RELATIVE_POSITION_TYPE
+  attn_dropout_rate = %ATTN_DROPOUT_RATE   # Attention matrix dropout.
+  dtype = %DTYPE
+
+# Infra shared by all transformer layers.
+transformer_base.TransformerBase:
+  attn_mlp_factory = @transformer_attn/nn_components.MLP
+  ffn_factory = @transformer_ffn/nn_components.MLPWrapper
+  normalize_keys = True               # More stable with Transformer XL.
+  dropout_rate = %DROPOUT_RATE
+  pre_attn_dropout = True
+  post_attn_dropout = False
+  pre_ffn_dropout = False
+  post_ffn_dropout = True
+
+transformer_attn/nn_components.MLP:
+  num_layers = 1                      # Just a single dense matmul.
+  hidden_activation = None
+  use_bias = False
+
+# Transformer MLP block.
+transformer_ffn/nn_components.MLPWrapper:
+  mlp_factory = @transformer_ffn/nn_components.SimpleMLP
+
+transformer_ffn/nn_components.SimpleMLP:
+  hidden_activation = "relu"
+
+nn_components.LayerNorm:
+  use_scale = True
+  use_bias = False
+  use_mean = False   # Calculate and adjust for the mean as well as the scale.
+  dtype = %DTYPE

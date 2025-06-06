@@ -1,0 +1,10 @@
+
+# Adds a single memory layer, using Dense KV memory.
+transformer_stack.TransformerStack:
+  side_layer_factory = @side_mem/recurrent_memory_layer.RecurrentMemoryLayer
+  side_layer_is_mlp = False
+
+side_mem/recurrent_memory_layer.RecurrentMemoryLayer:
+  recurrent_state_factory = @mem_t/dense_kv_memory.DenseKVMemory
+
+SIDE_LAYER_MLP_DIM = 16384

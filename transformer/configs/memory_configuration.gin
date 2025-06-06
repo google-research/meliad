@@ -2,7 +2,7 @@
 # This file should be included after base_htrans.gin.
 
 import  training_loop
-from transformer import memory_factory
+from transformer.memory import memory_factory
 
 MEMORY_HEAD_DIM = %HEAD_DIM
 NUM_MEMORY_HEADS = %gin.REQUIRED
@@ -20,3 +20,5 @@ training_loop.Trainer:
   checkpoint_every_steps = 1000
   generate_every_steps = 0  # disable generate mode when using external memory.
 
+decoder_stack.DecoderStack:
+  disable_position_encoding_for_memory_layers = True

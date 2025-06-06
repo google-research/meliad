@@ -1,11 +1,12 @@
 
+WINDOW_LENGTH = 512
+
 decoder_stack.DecoderStack:
   dstack_window_length = 0
   recurrent_layer_indices = (-3,)
   feedback_recurrence = False
 
 transformer_layer.TransformerLayer:
-  window_length = 512
   recurrent_num_states = 512
   recurrent_gate_type = "bias"
   recurrent_single_gate = True

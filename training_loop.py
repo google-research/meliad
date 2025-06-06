@@ -1,4 +1,4 @@
-# Copyright 2022 Google.
+# Copyright 2025 Google.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,29 +14,30 @@
 
 """Generic JAX training loop for experiments."""
 
-import functools
 import os
 from typing import (Any, Callable, Dict, Optional, Sequence, Tuple)
 
 from absl import logging
 from clu import metric_writers
-import flax
-from flax import jax_utils
-from flax import linen as nn
 from flax import struct
-from flax.training import checkpoints
 import gin
 import jax
 import jax.numpy as jnp
 import  metrics_summary
+import  model_info
 import  optimizer_config as opt_config
 import  training_task
-import numpy as np
 import tensorflow.compat.v2 as tf
 
 
-PRNGKeys = training_task.PRNGKeys
-TrainState = training_task.TrainState
+ModelInfo = model_info.ModelInfo
+ModelDefinition = model_info.ModelDefinition
+DatasetIteratorFunction = model_info.DatasetIteratorFunction
+TrainState = model_info.TrainState
+LearningRateScheduleFn = opt_config.LearningRateScheduleFn
+
+Optimizer = model_info.Optimizer
+PRNGKey = model_info.PRNGKey
 TrainingTask = training_task.TrainingTask
 StepFunction = training_task.StepFunction
 Metrics = training_task.Metrics
@@ -45,8 +46,6 @@ MetricsSummary = metrics_summary.MetricsSummary
 
 
 gfile = tf.io.gfile
-unfreeze = flax.core.unfreeze
-flatten_dict = flax.traverse_util.flatten_dict
 should_run = training_task.should_run
 
 
@@ -117,14 +116,15 @@ class Trainer:
   """Implements a JAX training loop."""
 
   # Returns a Flax module for the model.
-  # Takes a single argument mode, which can be "test", "train", or "generate".
-  model_definition: Any = gin.REQUIRED
+  # Takes a single argument 'mode', which can be "test", "train", or "generate".
+  model_definition: ModelDefinition = gin.REQUIRED
 
-  # Iterator over trainining data.
-  get_training_dataset_iterator: Callable[[], Any] = gin.REQUIRED
+  # Set one of either batch_size or batch_size_per_replica.
+  batch_size: int = 0                  # Total batch size over all replicas.
+  batch_size_per_replica: int = 0      # Batch size per replica.
 
-  # Iterator over test data.
-  get_test_dataset_iterator: Optional[Callable[[], Any]] = None
+  # Returns an iterator over the data set.
+  get_dataset_iterator_function: DatasetIteratorFunction = gin.REQUIRED
 
   workdir: str = ""                    # Working directory for checkpoints.
   load_dir: str = ""                   # Optional directory to load model.
@@ -133,13 +133,16 @@ class Trainer:
   log_every_steps: int = 100           # Log scalar data every N steps.
   test_every_steps: int = 10           # Test model every N steps.
   num_test_steps: int = 1              # Number of iterations to test.
+  reset_test_task: bool = True         # Reset test task before each eval.
+                                       # Reduces noise but can skew the test
+                                       # distribution.
   generate_every_steps: int = 1000     # Generate examples every N steps.
   print_input_every_steps: int = 1000  # Print example data every N steps.
+  parameter_metrics_every_steps: int = 2000  # Distributions of parameters.
 
   save_checkpoints: bool = True        # Save training checkpoints
   checkpoint_every_steps: int = 5000   # Save checkpoints every N steps.
-  restore_checkpoints: bool = True     # Restore from previous checkpoint.
-  restore_state_variables: bool = True  # Restore TrainState.state from chkpt.
+  keep_saving_configs: bool = False    # Save gin config when saving chkpts.
 
   # Record metrics for "train", "test", etc. in separate directories.
   # Otherwise they will be saved with separate prefixes.
@@ -147,8 +150,7 @@ class Trainer:
 
   # Optimizer options.
   optimizer_factory: opt_config.OptimizerConfig = gin.REQUIRED
-  learning_rate_schedule: Callable[[jnp.ndarray, int], jnp.ndarray] = (
-      opt_config.lr_cosine_decay)
+  learning_rate_schedule: LearningRateScheduleFn = opt_config.lr_cosine_decay
 
   # Maximum steps for the LR schedule.  Zero means use num_steps.
   max_scheduled_steps: int = 0
@@ -156,14 +158,8 @@ class Trainer:
   learning_rate_multiplier: float = 1.0  # Used to scale the learning rate.
 
   random_seed: int = 42                  # Initial random seed.
-
   # Names of random number generators used by the model.
   rng_key_names: Optional[Sequence[str]] = ("dropout",)
-
-  # Debug options.
-  replicate_mode: bool = True     # pmap over multiple replicas.
-  trace_debug_mode: bool = False  # Run in eager mode to trace results.
-  print_variables: bool = False   # Dump parameters/variables to stdout.
 
   # Function to compute additional summary information.
   # Takes a MetricsSummary object and a mode string (e.g. "test") as arguments,
@@ -174,14 +170,10 @@ class Trainer:
   pretty_print_input_function: Optional[Callable[[Any], Any]] = None
 
   # Classes to use for summarizing metrics.
-  metrics_summary_factory: Any = metrics_summary.MetricsSummary
-  extra_summaries_fn: training_task.ExtraSummariesFunction = (
-      lambda mode, step: dict())
+  metrics_summary_factory: Callable[[], MetricsSummary] = MetricsSummary
+  extra_summaries_fn: training_task.ExtraSummariesFunction = None
 
-  post_save_checkpoint_fn: Callable[[str, int], None] = lambda mode, step: None
-  post_load_checkpoint_fn: Callable[[str, int], None] = lambda mode, step: None
-
-  def learning_rate_schedule_fn(self, step):
+  def learning_rate_schedule_fn(self, step: jnp.ndarray) -> jnp.ndarray:
     """Returns the learning rate for the given step."""
 
     # There are four components to the learning rate.
@@ -207,16 +199,20 @@ class Trainer:
     else:
       max_steps = self.max_scheduled_steps
 
-    base_lrate = float(self.optimizer_factory.learning_rate)
+    base_lrate = float(self.optimizer_factory.learning_rate())
     lr_multiplier = float(self.learning_rate_multiplier)
 
     # Linear increase in learning rate up to warmup_steps.
-    warmup_steps = float(self.warmup_steps)
-    lr_warmup_ramp = jnp.minimum(step, warmup_steps) / warmup_steps
+    if self.warmup_steps > 0:
+      warmup_steps = float(self.warmup_steps)
+      lr_warmup_ramp = jnp.minimum(step, warmup_steps) / warmup_steps
 
-    # Hold step at a constant value during the warmup period.
-    # Required for some schedules, like rsqrt_decay.
-    step = jnp.maximum(step, warmup_steps)
+      # Hold step at a constant value during the warmup period.
+      # Required for some schedules, like rsqrt_decay.
+      step = jnp.maximum(step, warmup_steps)
+      del warmup_steps
+    else:
+      lr_warmup_ramp = 1.0
 
     # Get the scheduled learning rate.
     lrate = self.learning_rate_schedule(step, max_steps)
@@ -225,264 +221,34 @@ class Trainer:
     lrate = lrate * base_lrate * lr_warmup_ramp * lr_multiplier
     return jnp.asarray(lrate, dtype=jnp.float32)
 
-  def _init_rngs(self, rngs: PRNGKeys, step: int) -> PRNGKeys:
-    # Get a new random number generator for each step
-    rngs = jax.random.fold_in(rngs, step)
-    rngs = jax.random.split(rngs, len(self.rng_key_names))
-    rngs = {key: rngs[i] for i, key in enumerate(self.rng_key_names)}
-    return rngs
+  def create_model_info(self) -> ModelInfo:
+    """Initialize the model and/or load it from a checkpoint."""
 
-  def train_step(self, model: nn.Module, tstate: TrainState, x: Any,
-                 rngs: PRNGKeys) -> Tuple[TrainState, Metrics]:
-    """Perform a training step, pmapped over multiple devices.
+    mdl_info = ModelInfo(
+        model_definition=self.model_definition,
+        optimizer_def=self.optimizer_factory.create_optimizer_def(),
+        workdir=self.workdir,
+        load_dir=self.load_dir,
+        rng_key_names=self.rng_key_names,
+        batch_size=self.batch_size,
+        batch_size_per_replica=self.batch_size_per_replica,
+        random_seed=self.random_seed)
 
-    Args:
-      model:  The model to use for the step function.
-      tstate: Values for state variables, and the optimizer.
-      x:      A batch of inputs to train on.
-      rngs:   PRNGKey (possibly replicated).
+    logging.info("Initialized model.")
+    return mdl_info
 
-    Returns:
-      Tuple of (new_tstate, metrics: dictionary of scalar values)
-    """
+  def save_checkpoint(self, mdl_info: ModelInfo,
+                      tstate: TrainState, step: int):
+    """Save checkpoint."""
+    mdl_info.save_checkpoint(tstate, step)
 
-    mutable_keys = [k for (k, _) in tstate.state.items()]
-    step = tstate.optimizer.state.step
-    rngs = self._init_rngs(rngs, step)
-
-    # Refactor the model as a loss function from trainable params to loss, so
-    # that we can differentiate with jax and get {d}loss/{d}params.
-    # Inputs and non-trainable params are bound within the closure.
-    # model:: x, { state_params } -> (loss, metrics), { new_state_params }
-    # loss_fn:: params -> (loss, (metrics, new_state))
-    def loss_fn(params):
-      """Loss function."""
-      (loss, mets), nstate = model.apply({"params": params, **tstate.state},
-                                         x,
-                                         rngs=rngs,
-                                         mutable=mutable_keys)
-      return loss, (mets, nstate)
-
-    # grad_fn:: params -> ((loss, (aux, nstate)), param_gradients)
-    grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
-
-    # Run forward and backward pass.
-    (loss, (metrics, new_state)), param_grads = grad_fn(tstate.optimizer.target)
-    del loss  # loss is only recorded if it is part of the metrics
-    if self.replicate_mode:
-      param_grads = jax.lax.pmean(param_grads, axis_name="batch")
-    lrate = self.learning_rate_schedule_fn(step)
-    new_optimizer = tstate.optimizer.apply_gradient(
-        param_grads, learning_rate=lrate)
-
-    # Metrics are summary values that will be logged.
-    if self.replicate_mode:
-      # Merge metrics (take mean/sum etc.) over replicas on-device.
-      summary_class = self.metrics_summary_factory
-      metrics = summary_class.merge_replicated_metrics(
-          metrics, model.metrics_summary_operations(aggregate_over="devices"))
-
-    metrics["learning_rate"] = lrate
-    return (TrainState(new_optimizer, new_state), metrics)
-
-  def other_step(self, model: nn.Module, tstate: TrainState, x: Any,
-                 rngs: PRNGKeys) -> Tuple[TrainState, Metrics]:
-    """Perform a test or generate step, pmapped over multiple devices.
-
-    Args:
-      model:  The model to use for the step function.
-      tstate: Values for state variables, and the optimizer.
-      x:      A batch of inputs to train on.
-      rngs:   PRNGKey (possibly replicated).
-
-    Returns:
-      Tuple of (new_tstate, metrics: dictionary of scalar values)
-    """
-
-    mutable_keys = [k for (k, _) in tstate.state.items()]
-    step = tstate.optimizer.state.step
-    rngs = self._init_rngs(rngs, step)
-
-    params = tstate.optimizer.target
-    (loss, metrics), new_state = model.apply({"params": params, **tstate.state},
-                                             x,
-                                             rngs=rngs,
-                                             mutable=mutable_keys)
-    del loss  # loss is only recorded if it is part of the metrics
-
-    # Metrics are summary values that will be logged.
-    if self.replicate_mode:
-      # Merge metrics (take mean/sum etc.) over replicas on-device.
-      summary_class = self.metrics_summary_factory
-      metrics = summary_class.merge_replicated_metrics(
-          metrics, model.metrics_summary_operations(aggregate_over="devices"))
-
-    return (TrainState(tstate.optimizer, new_state), metrics)
-
-  def initialize_model(self) -> Tuple[TrainState, int, nn.Module, PRNGKeys]:
-    """Initialize the model and/or load it from a checkpoint.
-
-    Returns:
-      (tstate: TrainState,  -- The parameters and state for the the model.
-       start_step: int,     -- The step number, when restoring from checkpoint.
-       imodel: nn.Module,   -- A model object (created with mode "init").
-       rngs: PRNGkeys)      -- Initial random numbers.
-    """
-
-    # Set up random number generators.
-    # ---------------------------------
-    logging.info("==== Training loop: initializing model ====")
-    logging.info("Process %d of %d", jax.process_index(), jax.process_count())
-    logging.info("Local device count = %d", jax.local_device_count())
-    logging.info("Number of replicas = %d",
-                 jax.process_count() * jax.local_device_count())
-    logging.info("Using random number seed %d", self.random_seed)
-
-    prng = jax.random.PRNGKey(self.random_seed)
-    prng, init_rng = jax.random.split(prng)
-
-    # Grab rngs, which provide different random numbers for each replica.
-    if self.replicate_mode:
-      prngs = jax.random.split(prng, jax.local_device_count())
-    else:
-      prngs = prng
-    del prng
-
-    # Create a dictionary of prng keys for initialization.
-    rng_key_names_init = list(self.rng_key_names) + ["params"]
-    init_rngs = jax.random.split(init_rng, len(rng_key_names_init))
-    init_rngs = {key: init_rngs[i] for i, key in enumerate(rng_key_names_init)}
-    del init_rng
-
-    # Build Model
-    # -------------------------------------------------------------------------
-    logging.info("Initializing the model.")
-
-    # Create a model, which will be used to initialize trainable parameters.
-    imodel = self.model_definition(mode="init")
-
-    # The init function will lazily initialize the model, given a fake input.
-    # It returns initialized variables, without doing a fwd pass.
-    model_init_fn = jax.jit(imodel.init)
-    variables = model_init_fn(init_rngs, imodel.get_fake_input())
-
-    # Split variables into trainable and non-trainable sets.
-    mstate, params = variables.pop("params")
-    del variables  # Delete to avoid wasting resources.
-
-    # Create an optimizer for params.
-    optimizer_def = self.optimizer_factory.create_optimizer_def()
-    optimizer = optimizer_def.create(params)
-
-    # tstate holds the full training state of the model.
-    tstate = TrainState(optimizer, mstate)
-    if self.print_variables:
-      logging.info("params = %s", tstate.optimizer.target)
-      logging.info("state = %s", tstate.state)
-
-    # Load a pre-trained model or restore it from checkpoint.
-    if self.workdir or self.load_dir:
-      restore_checkpoints = self.restore_checkpoints
-    else:
-      restore_checkpoints = False
-
-    start_step = 0
-    if restore_checkpoints:
-      tstate = self.restore_checkpoint(tstate)
-      start_step = int(tstate.optimizer.state.step)
-
-    # Log info on trainable parameters (before replicating them).
-    self._write_parameter_info(tstate)
-    # raise ValueError("That's all folks!")
-
-    # Replicate the training state across local devices.
-    if self.replicate_mode:
-      tstate = jax_utils.replicate(tstate)
-
-    return (tstate, start_step, imodel, prngs)
-
-  def restore_checkpoint(self, train_state: TrainState) -> TrainState:
-    """Load a pre-trained model or restore it from a checkpoint."""
-
-    # Figure out if we have an existing checkpoint.
-    if not self.workdir:
-      logging.info("No working directory specified.")
-      existing_checkpoint = False
-    elif not gfile.exists(self.workdir):
-      logging.info("No existing checkpoint directory %s", self.workdir)
-      existing_checkpoint = False
-    elif not gfile.isdir(self.workdir):
-      raise ValueError(f"workdir {self.workdir} must be a directory.")
-    else:
-      ckpath = checkpoints.latest_checkpoint(self.workdir, "checkpoint_")
-      if ckpath:
-        logging.info("Found existing checkpoint in %s", self.workdir)
-        existing_checkpoint = True
-      else:
-        logging.info("No existing checkpoint in %s", self.workdir)
-        existing_checkpoint = False
-
-    # If any checkpoints exist in workdir, then use those first.
-    # This will ensure that the task will restore properly if it's preempted.
-    if existing_checkpoint:
-      logging.info("Restoring model from last checkpoint %s:", self.workdir)
-      load_dir = self.workdir
-    elif self.load_dir:
-      logging.info("Loading pre-trained model from %s:", self.load_dir)
-      load_dir = self.load_dir
-    else:
-      logging.warning("Unable to load model.")
-      return train_state
-    loaded_train_state = checkpoints.restore_checkpoint(load_dir, train_state)
-    step = int(loaded_train_state.optimizer.state.step)
-    self.post_load_checkpoint_fn(load_dir, step)
-
-    if self.restore_state_variables:
-      # Restore complete state.
-      logging.info("Restoring all variables and state.")
-      train_state = loaded_train_state
-      del loaded_train_state
-    else:
-      # Restore trainable variables, but not other state.
-      logging.info("Only restoring trainable parameters.")
-      train_state = TrainState(loaded_train_state.optimizer, train_state.state)
-      del loaded_train_state
-
-    return train_state
-
-  def save_checkpoint(self, tstate: TrainState, step: int,
-                      param_summary: Optional[MetricsSummary]):
-    """Save a checkpoint with the model state.
-
-    Args:
-      tstate: The training state.
-      step: The current step number.
-      param_summary: Optional metrics summary to write parameter statistics.
-    """
-
-    logging.info("Saving checkpoint in directory %s", self.workdir)
-    if self.replicate_mode:
-      save_state = jax_utils.unreplicate(tstate)
-    else:
-      save_state = tstate
-    checkpoints.save_checkpoint(self.workdir, save_state, step)
-
-    # While we're at it, record distributions of trainable parameters.
-    if param_summary is not None:
-      logging.info("Recording parameter distributions.")
-      params_dict = jax.device_get(
-          _flatten_dict_string_keys(save_state.optimizer.target))
-      param_distribs = self._compute_parameter_distributions(params_dict)
-      param_summary.add(param_distribs)
-
-  def create_training_task(self, mode: str, imodel: nn.Module, prngs: PRNGKeys,
+  def create_training_task(self, mode: str, mdl_info: ModelInfo,
                            writers: Dict[str, MetricWriter]) -> TrainingTask:
     """Create a new TrainingTask for the given mode.
 
     Args:
       mode: The mode for the task, e.g. "train", "test", "generate".
-      imodel: The model object from initialize_model.
-      prngs: The PRNGKeys from initialize_model.
+      mdl_info: A ModelInfo object from initialize_model().
       writers: A dictionary of summary writers.
 
     Returns:
@@ -495,35 +261,34 @@ class Trainer:
     else:
       prefix = mode
 
-    if mode == "train":
-      ds = self.get_training_dataset_iterator
-    elif mode == "test":
-      ds = self.get_test_dataset_iterator
+    # Get an iterator over the data set for the given mode
+    if mode == "train" or mode == "test":
+      ds = self.get_dataset_iterator_function(mode, mdl_info.num_shards,
+                                              mdl_info.shard_id,
+                                              mdl_info.batch_size_per_shard)
     else:
       ds = None
 
-    # We summarize metrics over multiple training steps.
-    # These types control how the summary is computed.
-    metric_summary_ops = {
-        "step_time": "mean",
-        "learning_rate": "last",
-        **imodel.metrics_summary_operations(aggregate_over="steps")
-    }
-    summary = self.metrics_summary_factory(metric_summary_ops)
-    extra_summary = self.metrics_summary_factory({})
+    # Get a step function for the given mode.
+    if mode == "train":
+      step_fn = mdl_info.train_step_fn(self.learning_rate_schedule_fn)
+    else:
+      step_fn = mdl_info.other_step_fn(mode)
+
+    summary = self.metrics_summary_factory()
+    extra_summary = self.metrics_summary_factory()
     summary_writer = self._get_summary_writer(mode, writers)
 
     return TrainingTask(
         mode=mode,
         dataset=ds,
-        step_function=self._compile_step_function(mode),
-        prng_keys=prngs,
+        step_function=step_fn,
+        mdl_info=mdl_info,
         summary=summary,
         extra_summary=extra_summary,
         summary_writer=summary_writer,
         summary_prefix=prefix,
         # --- options ---
-        replicate_mode=self.replicate_mode,
         print_input_every_steps=self.print_input_every_steps,
         pretty_print_input_function=self.pretty_print_input_function,
         process_summaries_function=self.process_summaries_function,
@@ -532,47 +297,42 @@ class Trainer:
   def train(self):
     """Runs the training and evaluation loop."""
 
-    # The master process saves checkpoints and summaries to disk.
-    is_master_process = jax.process_index() == 0
-    if self.workdir:
-      save_checkpoints = self.save_checkpoints
-    else:
-      save_checkpoints = False
-
     # --- Create and initialize the model. ---
-    (tstate, start_step, imodel, prngs) = self.initialize_model()
+    mdl_info = self.create_model_info()
+    tstate = mdl_info.initialize_model()
 
-    # Log experiment hyper-parameters.
+    # Create summary writer for train mode.
     writers = {}
     train_writer = self._get_summary_writer("train", writers)
-    if start_step == 0:
-      self._write_config(train_writer)
 
     # Additional summary objects.
-    param_summary = self.metrics_summary_factory({})  # Parameter statistics.
+    param_summary = self.metrics_summary_factory()  # Parameter statistics.
 
     # --- Create task objects for test, train, and generate. ---
     tasks = {}
-    train_task = self.create_training_task("train", imodel, prngs, writers)
+    train_task = self.create_training_task("train", mdl_info, writers)
     tasks["train"] = train_task
 
-    if (self.get_test_dataset_iterator is not None and
-        self.test_every_steps != 0):
-      test_task = self.create_training_task("test", imodel, prngs, writers)
+    test_task = None
+    gen_task = None
+    if self.test_every_steps != 0:
+      test_task = self.create_training_task("test", mdl_info, writers)
       tasks["test"] = test_task
       if self.generate_every_steps != 0:
-        gen_task = self.create_training_task("generate", imodel, prngs,
-                                             writers)
+        gen_task = self.create_training_task("generate", mdl_info, writers)
         tasks["generate"] = gen_task
 
     # Register any additional actions.
     register_interstep_callbacks()
 
+    # Log experiment hyper-parameters.
+    self._write_config(train_writer, mdl_info.step)
+
     # Main Training Loop
-    # --------------------------------------------------------------------------
+    # -------------------------------------------------------------------------
     logging.info("==== Training loop: starting main loop ====")
     with metric_writers.ensure_flushes(*writers.values()):
-      for step in range(start_step, self.num_steps):
+      for step in range(mdl_info.step, self.num_steps):
         # Log status every so often to monitor progress.
         if should_run(step, self.status_every_steps):
           logging.info("Step: %d", step)
@@ -585,8 +345,12 @@ class Trainer:
 
         # Test.
         if should_run(step, self.test_every_steps):
+          assert test_task is not None
           if self.num_test_steps > 1:
             logging.info("Test cycle: %d iterations.", self.num_test_steps)
+          if self.reset_test_task:
+            test_task.reset_dataset()
+          test_x = None
           for sub_step in range(0, self.num_test_steps):
             test_x = test_task.get_next_input()
 
@@ -595,6 +359,7 @@ class Trainer:
             # Generate is run just *before* the last test iteration.
             if ((sub_step == self.num_test_steps - 1) and
                 should_run(step, self.generate_every_steps)):
+              assert gen_task is not None
               logging.info("Generate cycle.")
               (tstate, _) = gen_task.run_step(tstate, test_x, step)
               run_interstep_callbacks("generate", step)
@@ -604,58 +369,37 @@ class Trainer:
             run_interstep_callbacks("test", step, sub_step)
           del test_x
 
-        # --- Save checkpoints on the master host. ---
-        is_last_step = (step == self.num_steps - 1)
-        checkpoint_current_step = (
-            save_checkpoints and
-            (should_run(step, self.checkpoint_every_steps) or is_last_step))
-        if checkpoint_current_step:
-          if is_master_process:
-            self.save_checkpoint(tstate, step, param_summary)
-          self.post_save_checkpoint_fn(self.workdir, step)
-
         # --- Flush summaries to disk. ---
+        # Only the master process will write to disk; see _get_summary_writer.
         if should_run(step, self.log_every_steps):
           for tsk in tasks.values():
             tsk.flush(step)
+
+        # --- Log distributions of trainable parameters. ---
+        if should_run(step, self.parameter_metrics_every_steps):
+          param_metrics = mdl_info.compute_parameter_metrics(tstate)
+          param_summary.merge(param_metrics)
           param_summary.write(train_writer, step, prefix="params")
+          del param_metrics
 
+        # --- Save checkpoints on the master host. ---
+        is_last_step = (step == self.num_steps - 1)
+        if should_run(step, self.checkpoint_every_steps) or is_last_step:
+          self.save_checkpoint(mdl_info, tstate, step)
+          if self.keep_saving_configs:
+            self._write_config(train_writer, step=step)
+      # end of with statement
     logging.info("Training Finished.")
-    if self.replicate_mode:
-      tstate = jax_utils.unreplicate(tstate)
-    if self.print_variables:
-      logging.info("params = %s", tstate.optimizer.target)
-      logging.info("state = %s", tstate.state)
 
-  def _compile_step_function(self, mode: str) -> StepFunction:
-    """Compile a step function (training or test)."""
-
-    # Create a model object, and a step function that is a closure over the
-    # object.  Flax modules are supposed to be "stateless", in that all state
-    # is contained the TrainState object that is passed as an input parameter.
-    # However, creating the model object may involve allocating expensive
-    # data structures, or launching processes, and should only be done once.
-    model = self.model_definition(mode=mode)
-    if mode == "train":
-      step_fn = functools.partial(self.train_step, model)
-    else:
-      step_fn = functools.partial(self.other_step, model)
-
-    if self.replicate_mode:
-      assert not self.trace_debug_mode
-      logging.info("Compiling mode %s with pmap.", mode)
-      p_fn = jax.pmap(step_fn, donate_argnums=(0,), axis_name="batch")
-    elif self.trace_debug_mode:
-      logging.info("Compiling mode %s with trace_debug.", mode)
-      p_fn = step_fn
-    else:
-      logging.info("Compiling mode %s with jit.", mode)
-      p_fn = jax.jit(step_fn, donate_argnums=(0,))
-    return p_fn
+    # Return current model state.
+    # Can be used in colab to step the model forward from this point.
+    return (mdl_info, tstate, tasks)
 
   def _get_summary_writer(self, mode: str,
                           writers: Dict[str, MetricWriter]) -> MetricWriter:
     """Create a summary writer for the given mode.
+
+    Note that only the master process will write to disk.
 
     Args:
       mode: the mode for the summaries, e.g. "test", "train"
@@ -696,62 +440,20 @@ class Trainer:
     writers[w_mode] = writer
     return writer
 
-  def _write_config(self, writer):
+  def _write_config(self, writer, step: int):
     """Write the configuration file to the working directory."""
 
     is_master = jax.process_index() == 0
     config_str = gin.operative_config_str()
-    logging.info("Gin config: \n%s", config_str)
+    # logging.info("Gin config: \n%s", config_str)  # logged in launcher.py.
+
+    # Write config string text to tensorboard.
+    writer.write_texts(step, {"config": gin.markdown(config_str)})
 
     # Write configuration to workdir.
     if is_master and self.workdir:
-      config_file_name = os.path.join(self.workdir, "config.gin")
+      logging.info("Writing config.gin")
+      config_file_name = os.path.join(self.workdir, f"config_{step}.gin")
       with gfile.GFile(config_file_name, "w") as f:
         f.write(config_str)
 
-    # Write config string text to tensorboard.
-    writer.write_texts(0, {"config": gin.markdown(config_str)})
-
-  def _write_parameter_info(self, tstate: TrainState):
-    """Write information on state and trainable parameters to the log."""
-
-    # Write information on parameters to log file.
-    params_dict = _flatten_dict_string_keys(tstate.optimizer.target)
-    total_nparams = 0
-    for (k, v) in params_dict.items():
-      nparams = np.prod(v.shape)
-      total_nparams += nparams
-      logging.info("parameter: %s, shape %s, size %d", k, v.shape, nparams)
-    logging.info("Total parameters: %d", total_nparams)
-
-    # Write information on state variables to log file.
-    state_dict = _flatten_dict_string_keys(tstate.state)
-    state_size = 0
-    total_state = 0
-    for (k, v) in state_dict.items():
-      if hasattr(v, "shape"):
-        state_size = np.prod(v.shape)
-        total_state += state_size
-        logging.info("state: %s, shape %s, size %d", k, v.shape, state_size)
-      else:
-        # Some other stuff may be stored in the state.
-        logging.info("state: %s [unknown]", k)
-    logging.info("Total state size: %d", total_state)
-
-  def _compute_parameter_distributions(self, params_dict):
-    """Compute info on distributions of parameters."""
-
-    scalar_params_dict = {}
-    for (k, v) in params_dict.items():
-      # Convert from bfloat16, which crashes when serializing a NaN.
-      v = np.asarray(v, dtype=jnp.float32)
-      scalar_params_dict[k + "_mean"] = np.mean(v)
-      scalar_params_dict[k + "_stddev"] = np.std(v)
-      # scalar_params_dict[k + "_min"] = np.min(v)
-      # scalar_params_dict[k + "_max"] = np.max(v)
-    return scalar_params_dict
-
-
-def _flatten_dict_string_keys(params):
-  """Flattens a nested dictionary to have string keys and '/' separators."""
-  return {"/".join(k): v for k, v in flatten_dict(unfreeze(params)).items()}

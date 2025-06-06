@@ -1,0 +1,6 @@
+from transformer import position_alibi
+
+RELATIVE_POSITION_TYPE = "alibi"
+
+position_alibi.BoundedALiBi:
+  fixed_bound = 2.0
